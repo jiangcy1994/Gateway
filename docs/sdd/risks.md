@@ -60,10 +60,10 @@
 - 缓解：`install` 只生成带 `change-me` 的模板，不写入真实密钥；依赖 `%ProgramData%` 的默认 ACL（Administrators/System 可写，普通用户只读）限制访问；部署后应立即改为高熵值并通过管理 API 验证；密钥不进版本管理
 - 验证：install 后检查模板内容为占位值；`icacls "%ProgramData%\top-gateway"` 确认普通用户无写权限；`GET /__admin/routes` 不带 key 返回 401
 
-## R9 SCM 注册/停止的实机生命周期尚未在本机验证
+## R9 SCM 注册/停止的实机生命周期
 
-- 可能性：当前为既成事实（开发 shell 非管理员，无法 `install`/`start`）
-- 影响：服务壳代码（`src/service.rs`）只经过了编译、`run`/`status`（未安装路径）与网关本体的回归验证；`service_main` 的状态上报、Stop 注入 `run_with_shutdown` 的真实路径未经 SCM 触发
-- 缓解：状态机完全由 `windows-service` 0.7 的类型约束（`ServiceStatus`/`ServiceExitCode`）撑起，网关本体复用已测的 `run_with_shutdown`；接口契约已写入 `interfaces.md` 的 service.rs 节，验证步骤明确
-- 验证（需管理员 PowerShell）：`top-gateway install && top-gateway start`，`status` 期望 `Running` 且 `curl /health` 返回 `{"status":"ok"}`；`top-gateway stop` 后 `status` 期望 `Stopped`（退出码 0），服务基目录下 `top-gateway.log` 含完整启动/关闭记录；最后 `uninstall`
+- 可能性：已闭环（2026-11-01 在本机管理员会话完成验证）
+- 影响：无——`install`/`start`/`stop`/`status` 均按契约执行
+- 缓解：状态机完全由 `windows-service` 0.7 的类型约束（`ServiceStatus`/`ServiceExitCode`）撑起，网关本体复用已测的 `run_with_shutdown`；接口契约见 `interfaces.md` 的 service.rs 节
+- 验证（管理员 PowerShell）：`install` → DEMAND_START + `%ProgramData%\top-gateway` 自动建立；`start` → `status` 为 `Running (pid, Win32(0))`，`/health` 返回 `{"status":"ok"}`；`stop` → 30s 内回到 `Stopped (Win32(0))`，日志含 `shutdown complete`（SCM 停止信号确实经 oneshot 注入 `run_with_shutdown`）。其余覆盖：1063 直启提示、1060 未安装、1062 重复 start、os error 5 提权提示
 
