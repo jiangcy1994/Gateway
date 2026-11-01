@@ -73,6 +73,7 @@ fn test_settings(routes_path: PathBuf, admin_key: Option<&str>) -> Settings {
         bind: "127.0.0.1:0".to_string(),
         admin_key: admin_key.map(str::to_string),
         routes_file: routes_path,
+        providers_file: std::path::PathBuf::from("providers.toml"),
         health_interval_secs: 1,
         health_timeout_secs: 2,
         default_timeout_secs: 30,

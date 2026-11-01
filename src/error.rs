@@ -26,6 +26,21 @@ pub enum ApiError {
     #[error("routes file could not be written: {0}")]
     Persist(String),
 
+    #[error("provider not found: {0}")]
+    ProviderNotFound(String),
+
+    #[error("invalid provider: {0}")]
+    InvalidProvider(String),
+
+    #[error("provider id already exists: {0}")]
+    DuplicateProviderId(String),
+
+    #[error("no enabled provider for protocol '{0}'")]
+    NoProviderForProtocol(String),
+
+    #[error("quota exhausted for protocol '{0}': all providers are at their rpm or tpm limit")]
+    QuotaExhausted(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -41,6 +56,12 @@ impl ApiError {
             ApiError::ConfigLoad(_) | ApiError::Persist(_) | ApiError::Internal(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
+            ApiError::ProviderNotFound(_) => StatusCode::NOT_FOUND,
+            ApiError::InvalidProvider(_) | ApiError::DuplicateProviderId(_) => {
+                StatusCode::BAD_REQUEST
+            }
+            ApiError::NoProviderForProtocol(_) => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::QuotaExhausted(_) => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 }

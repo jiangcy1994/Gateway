@@ -4,11 +4,14 @@ use std::sync::{Arc, RwLock};
 use crate::config::{self, Settings};
 use crate::error::ApiError;
 use crate::health::HealthState;
+use crate::llm::provider::ProviderTable;
+use crate::llm::quota::QuotaTracker;
 use crate::metrics::RouteStats;
 use crate::router::RouteTable;
 
-/// Shared state behind every handler: the route table, per-route stats and health
-/// records, the HTTP client used for proxying, and the process settings.
+/// Shared state behind every handler: the route table, provider table, per-route
+/// stats and health records, the HTTP client used for proxying, and the process
+/// settings.
 ///
 /// Cloning is cheap: every field is either already an `Arc` or becomes one here,
 /// so handlers clone the state instead of wrapping it in another `Arc`.
@@ -17,8 +20,11 @@ pub struct AppState {
     pub settings: Settings,
     pub client: reqwest::Client,
     pub routes: RouteTable,
+    pub providers: ProviderTable,
     pub(crate) stats: Arc<RwLock<HashMap<String, Arc<RouteStats>>>>,
     pub(crate) health: Arc<RwLock<HashMap<String, HealthState>>>,
+    pub(crate) llm_stats: Arc<RwLock<HashMap<String, Arc<RouteStats>>>>,
+    pub(crate) llm_quotas: Arc<RwLock<HashMap<String, Arc<QuotaTracker>>>>,
 }
 
 impl AppState {
@@ -30,8 +36,11 @@ impl AppState {
             settings,
             client,
             routes: RouteTable::default(),
+            providers: ProviderTable::default(),
             stats: Arc::new(RwLock::new(HashMap::new())),
             health: Arc::new(RwLock::new(HashMap::new())),
+            llm_stats: Arc::new(RwLock::new(HashMap::new())),
+            llm_quotas: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -48,10 +57,42 @@ impl AppState {
             .clone()
     }
 
+    /// Stats for an LLM provider. Kept in a map separate from routes so route ids
+    /// and provider ids cannot collide（ADR-L9）。
+    pub fn llm_stats_for(&self, id: &str) -> Arc<RouteStats> {
+        if let Some(stats) = self.llm_stats.read().unwrap().get(id) {
+            return stats.clone();
+        }
+        let mut stats = self.llm_stats.write().unwrap();
+        stats
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(RouteStats::default()))
+            .clone()
+    }
+
+    /// Quota tracker for a provider, creating it on first use. Trackers survive
+    /// provider deletion so history is not lost; the quota view only joins the
+    /// current table.
+    pub fn quota_for(&self, id: &str) -> Arc<QuotaTracker> {
+        if let Some(tracker) = self.llm_quotas.read().unwrap().get(id) {
+            return tracker.clone();
+        }
+        let mut trackers = self.llm_quotas.write().unwrap();
+        trackers
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(QuotaTracker::new()))
+            .clone()
+    }
+
     /// Rewrites the routes file from the current in-memory table. Every admin
     /// mutation that changes routing persists before returning, so a crash or
     /// restart never loses a configuration change.
     pub fn persist(&self) -> Result<(), ApiError> {
         config::save_routes(&self.settings.routes_file, &self.routes.list())
+    }
+
+    /// Same contract as `persist`, for the providers table（ADR-L10：独立文件）。
+    pub fn persist_providers(&self) -> Result<(), ApiError> {
+        config::save_providers(&self.settings.providers_file, &self.providers.list())
     }
 }

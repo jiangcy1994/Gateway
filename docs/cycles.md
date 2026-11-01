@@ -92,3 +92,49 @@ top-gateway 的功能按 `sdd/architecture.md` 的依赖底向上实现：`route
 ## 循环与契约的对应
 
 每条循环的断言都落在 `../sdd/interfaces.md` 的具体条目上（如 C7 → 502/504 状态码表，C8 → 管理端点表，C11 → `health_snapshot` 后置条件）。新增功能前先改 interfaces.md，再按上述范式开新循环。
+
+---
+
+## LLM 子网关（`src/llm/`，`tests/llm_gateway.rs`）
+
+按 `sdd/llm/interfaces.md`（实现权威）实现：`provider`（共享表示）→ `quota`（计量）→ `usage`（提取）→ `balancer`（选择）→ `admin/forward`（端点）→ `state`/`config`/`lib`（装配）。依赖底向上、每条循环先改规格再写测试。
+
+### C16 编译期红灯：模块与装配契约不存在（→ `lib.rs` 集成）
+- 红[红]：23 条测试一次性产出 **11 条编译错误**——`Settings` 无 `providers_file`、`AppState` 无 `providers`、`llm` 模块不存在、测试里 `Route` 字面量缺 `description`/`timeout_secs`。这是「API 尚不存在」时的合法红灯形态（等价于运行期 FAIL）。
+- 绿：按规格补 `llm` 模块与 `Settings`/`AppState` 字段；测试里补齐 `Route` 字面量。
+- 重构：`build_app` 在 admin nest 与 fallback 之间插入 `nest("/llm", llm::llm_router())`，依赖 axum nest 优先于 fallback 保证保留前缀（ADR-L5）。
+
+### C17 协议段路由与凭证注入（→ `llm/forward` 后置第 1/6 步）
+- 红[红]：`llm_forwards_openai_path_and_bearer_key` —— 首版路径拼接把 `/llm` 段再次透传给上游；客户端 `Authorization` 未被替换成供应商凭证。
+- 绿：剥 `/llm` 后按首个 `/` 切出协议段（空/未知 → 404 house 体），凭证按协议注入（openai/systemone → `Authorization: Bearer`；anthropic → `x-api-key` + 缺省才补的 `anthropic-version`）。
+- 重构：剥离集合（hop-by-hop + content-length + host + authorization + x-api-key）复用 `proxy::is_filtered` 并追加三个名字，单一谓词两个方向共用。
+
+### C18 加权选择：剩余配额加权 + 全满 429（→ `select_and_record` 后置）
+- 红[红]：随机性下不能断言「分布」，首轮用「两个供应商各 rpm_limit=1」的边界形态：耗尽者权重 0 被排除、第三个供应商仍可选中（2×200 且 provider 不同 + 一次 429），替代分布断言。
+- 绿：`weight = min(rpm_ratio, tpm_ratio)`（不限维度 = 1.0），权重 0 排除，全 0 → `QuotaExhausted`（429）。
+- 重构：选择与 RPM 记账合并进**同一临界区**，按 `ProviderTable` 顺序一次性加锁全部 tracker（无 await、固定锁序），杜绝并发超额选择与死锁。
+
+### C19 TPM 事后计量：usage 提取不缓冲（→ `extract_tokens` 契约）
+- 红[红]：`llm_counts_tokens_from_streaming_final_chunk` —— 首版在转发前 `await bytes()` 收集整包，流式语义被破坏（客户端收不到逐块输出）。
+- 绿：`UsageTap<S>` 手写 `Stream`，每块转发同时复制进 64 KiB `TailBuffer`；流结束 / 上游出错 / 消费者断开（Drop）三种情形都触发一次 `extract_tokens → record_tokens`（`done` 标志互斥）。
+- 重构：借用排版事故两次：guard 借了临时 Arc（先收集 `Vec<Arc<QuotaTracker>>` 再加锁）与 `bytes_stream()` 移动 `upstream` 后再读其 headers（header 过滤循环提前到构造 tap 之前）。
+
+### C20 管理端点挂载：12 条测试一次性失败（→ `llm/admin` 端点表）
+- 红[红]：21 pass / 12 fail——quota/metrics/admin 全部 404，因为 `llm::admin::admin_router()` 从未挂进 `admin_router()`。
+- 绿：`admin_router()` 尾部 `.nest("/llm", ...)`，与路由管理端点共用同一 `require_admin`。
+- 重构：无（bug 纯属漏挂，测试即定位器）。
+
+### C21 PUT 合并语义：显式 `null` 与缺省必须分开（→ `ProviderPatch` 契约）
+- 红[红]：`llm_admin_provider_crud_and_persistence` —— `PUT {"rpm_limit": null}` 后 `rpm_limit` 仍是 60：serde 内置行为把 `null` 与字段缺省都映射成外层 `None`（保留原值），与规格「显式 `null` = 设为不限」冲突。
+- 绿：`deserialize_some` 反序列化器（`#[serde(default, deserialize_with = ...)]`）：缺省走 default 仍是 `None`，`null` 变 `Some(None)`，数字变 `Some(Some(n))`。
+- 重构：该配方提升为 `provider.rs` 的共有函数，注释说明 serde 行为差异（同 `RoutePatch` 的合并语义原则，但限额字段需要双层 Option）。
+
+### C22 钉子：缺必填字段 422（→ `llm/admin` 端点表注）
+- 红[红]：`llm_admin_rejects_invalid_provider` 期待 400 实得 **422**——axum 0.8 的 `Json` 提取器对缺必填字段返 422（与既有路由 API 同行为），`400` 只由 `validate()` 规则失败产生。
+- 绿：测试断言改 422，规格端点表登记该状态（house 格式错误体的 400 保留给 `validate` 失败与重复 id）。
+- 重构：无（接受框架标准行为，不为单端点定制 rejection 映射）。
+
+### C23 钉子：SystemOne 桩与查询串（→ ADR-L8 / `llm/forward` 后置第 5 步）
+- 红：`llm_systemone_stub_forwards_without_token_counting`、`llm_query_string_is_preserved` —— 两条绿灯钉子：前者钉住「SystemOne 全程可路由可转发，仅 usage 记账恒为 0」；后者钉住查询串拼接。均直接通过。
+- 绿：无新实现（桩与查询串在 C16-C19 的实现中已就位）。
+- 重构：无。

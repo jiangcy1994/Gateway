@@ -7,6 +7,7 @@ Rust 实现（axum + tokio + reqwest），与 `qqbot-api-gateway` 同一技术�
 client ──► top-gateway:8000
               ├─ /qqbot/*        ──► 127.0.0.1:8080  (qqbot-api-gateway)
               ├─ /qqbot-admin/*  ──► 127.0.0.1:8081  (管理后台)
+              ├─ /llm/*          ──► 内嵌 LLM 网关（按协议选供应商，见下文）
               └─ /__admin/*      ──► 本网关管理 API（不转发）
 ```
 
@@ -23,6 +24,7 @@ cargo fmt && cargo clippy --all-targets
 | `GATEWAY_BIND` | `127.0.0.1:8000` | 监听地址 |
 | `GATEWAY_ADMIN_KEY` | 未设置 | `/__admin/*` 的密钥；未设置时告警且放行 |
 | `GATEWAY_ROUTES_FILE` | `routes.toml` | 路由配置文件 |
+| `GATEWAY_PROVIDERS_FILE` | `providers.toml` | LLM 供应商配置文件 |
 | `GATEWAY_HEALTH_INTERVAL_SECS` | `10` | 健康检查轮询间隔 |
 | `GATEWAY_HEALTH_TIMEOUT_SECS` | `2` | 单次健康探测超时 |
 | `GATEWAY_DEFAULT_TIMEOUT_SECS` | `30` | 路由未指定时的上游超时 |
@@ -78,11 +80,58 @@ curl -X PUT http://127.0.0.1:8000/__admin/routes/svc \
 
 - **最长前缀匹配**：`/echo/special` 同时匹配 `/echo` 与 `/echo/special` 时取后者。
   未匹配任何前缀返回 `404`，路由被禁用返回 `503`，上游不可达 `502`，超时 `504`。
+- **`/llm` 为保留前缀**：`/llm/*` 由内嵌 LLM 网关处理（见下文），永远不会落
+  到前缀路由；不要在 `routes.toml` 里挂 `/llm` 前缀。
 - **流式转发**：请求/响应 body 逐块透传，不缓存，可代理大文件/流式接口。
 - **请求头**：剥离 hop-by-hop 头与 `Content-Length`，其余原样透传（含
   `Authorization`，由子网关自行鉴权）；附加 `x-forwarded-host` / `x-forwarded-path`；
   路由配置的 `headers` 在最后注入，可用来给子网关塞 `x-gateway-key`。
 - **错误 JSON**：`{"error":{"code":502,"message":"..."}}` 统一格式。
+
+## LLM 网关（`/llm/{protocol}/*`）
+
+内嵌子网关：同一入口下按协议段选择供应商池，客户端协议原样透传（不做协议
+互转），按供应商的 RPM/TPM 剩余配额加权选择；配额按**整个供应商**（底下全
+部模型合计）计算，60 秒滚动窗口。
+
+支持的协议段：`openai`、`anthropic`、`systemone`（systemone 可路由可转发，
+仅 usage 记账为桩，暂记 0）。凭证由网关按协议注入（openai/systemone 走
+`Authorization: Bearer`，anthropic 走 `x-api-key`），客户端凭证一律被替换。
+
+```bash
+# 客户端照常调用（以 openai 协议为例）
+curl http://127.0.0.1:8000/llm/openai/v1/chat/completions \
+  -d '{"model":"gpt-4o","messages":[...]}'
+# 响应头 x-llm-provider 指出本次选中的供应商
+```
+
+供应商在 `providers.toml` 配置（也可全程走管理 API）：
+
+```toml
+[[providers]]
+id = "openai-official"
+name = "OpenAI"
+protocol = "openai"             # openai | anthropic | systemone
+base_url = "https://api.openai.com"
+api_key = "sk-..."
+rpm_limit = 60                  # 每分钟请求数限额，缺省 = 不限
+tpm_limit = 100000              # 每分钟 token 数限额，缺省 = 不限
+enabled = true
+```
+
+LLM 管理端点（同样需要 `X-Admin-Key`）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/__admin/llm/providers` | 列出全部供应商 |
+| POST | `/__admin/llm/providers` | 新增供应商；`id` 省略时生成 UUID |
+| GET/PUT/DELETE | `/__admin/llm/providers/{id}` | 查看 / 合并式更新 / 删除（PUT 显式 `null` = 设为不限） |
+| GET | `/__admin/llm/quota` | 各供应商窗口内 RPM/TPM 用量与余量 |
+| GET | `/__admin/llm/metrics` | 各供应商请求数 / 并发 / 错误数 / 平均延迟 |
+
+选择行为：所有供应商满 RPM 或 TPM → `429`（`QuotaExhausted`）；协议下无启用
+供应商 → `503`。TPM 由响应尾包里的 `usage` 字段事后计量（非流式取 JSON，
+流式取末尾 `data:` 块），解析不到时记 0，永不失败。
 
 ## 持久化
 

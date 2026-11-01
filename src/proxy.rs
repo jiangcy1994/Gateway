@@ -157,7 +157,7 @@ pub async fn proxy(
         })
 }
 
-fn is_filtered(name: &HeaderName) -> bool {
+pub(crate) fn is_filtered(name: &HeaderName) -> bool {
     HOP_BY_HOP.contains(&name.as_str()) || name.as_str() == "content-length"
 }
 

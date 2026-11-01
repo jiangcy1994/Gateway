@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
+use crate::llm::provider::{Provider, ProvidersFile};
 use crate::router::Route;
 
 /// On-disk layout of the routes file: one `[[routes]]` table per mounted sub-gateway.
@@ -18,6 +19,8 @@ pub struct Settings {
     pub admin_key: Option<String>,
     /// Path of the TOML file holding the mounted routes.
     pub routes_file: std::path::PathBuf,
+    /// Path of the TOML file holding the LLM providers (ADR-L10：独立于 routes 文件）。
+    pub providers_file: std::path::PathBuf,
     /// Interval between background health checks of every enabled route.
     pub health_interval_secs: u64,
     /// Per-request timeout for a single health probe.
@@ -39,6 +42,9 @@ impl Settings {
             admin_key,
             routes_file: std::path::PathBuf::from(
                 std::env::var("GATEWAY_ROUTES_FILE").unwrap_or_else(|_| "routes.toml".into()),
+            ),
+            providers_file: std::path::PathBuf::from(
+                std::env::var("GATEWAY_PROVIDERS_FILE").unwrap_or_else(|_| "providers.toml".into()),
             ),
             health_interval_secs: env_u64("GATEWAY_HEALTH_INTERVAL_SECS", 10),
             health_timeout_secs: env_u64("GATEWAY_HEALTH_TIMEOUT_SECS", 2),
@@ -93,6 +99,55 @@ pub fn save_routes(path: &std::path::Path, routes: &[Route]) -> Result<(), ApiEr
     })
     .map_err(|e| ApiError::Persist(format!("serialize routes: {e}")))?;
     let body = format!("# top-gateway routes - managed file, rewrites drop comments\n{text}");
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .map_err(|e| ApiError::Persist(format!("create temp file in {}: {e}", dir.display())))?;
+    use std::io::Write;
+    tmp.write_all(body.as_bytes())
+        .map_err(|e| ApiError::Persist(format!("write temp file: {e}")))?;
+    tmp.persist(path)
+        .map_err(|e| ApiError::Persist(format!("replace {}: {e}", path.display())))?;
+    Ok(())
+}
+
+/// Loads providers from the TOML file. A missing file is not an error: startup
+/// proceeds with no providers (与 `load_routes` 同策略）。重复 id 只告警、全部保留。
+pub fn load_providers(path: &std::path::Path) -> Result<Vec<Provider>, ApiError> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let file: ProvidersFile = toml::from_str(&text)
+                .map_err(|e| ApiError::ConfigLoad(format!("{}: {e}", path.display())))?;
+            let mut seen = std::collections::HashSet::new();
+            for provider in &file.providers {
+                if !seen.insert(provider.id.clone()) {
+                    tracing::warn!(
+                        "duplicate provider id {} in {}, keeping both",
+                        provider.id,
+                        path.display()
+                    );
+                }
+            }
+            Ok(file.providers)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                "providers file {} not found; starting with no providers",
+                path.display()
+            );
+            Ok(Vec::new())
+        }
+        Err(e) => Err(ApiError::ConfigLoad(format!("{}: {e}", path.display()))),
+    }
+}
+
+/// Serializes all providers and replaces the providers file atomically (与
+/// `save_routes` 同策略；`api_key` 明文落盘，见 ADR-L11）。
+pub fn save_providers(path: &std::path::Path, providers: &[Provider]) -> Result<(), ApiError> {
+    let text = toml::to_string_pretty(&ProvidersFile {
+        providers: providers.to_vec(),
+    })
+    .map_err(|e| ApiError::Persist(format!("serialize providers: {e}")))?;
+    let body = format!("# top-gateway providers - managed file, rewrites drop comments\n{text}");
     let dir = path.parent().unwrap_or(std::path::Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir)
         .map_err(|e| ApiError::Persist(format!("create temp file in {}: {e}", dir.display())))?;

@@ -2,6 +2,7 @@ pub mod admin;
 pub mod config;
 pub mod error;
 pub mod health;
+pub mod llm;
 pub mod metrics;
 pub mod proxy;
 pub mod router;
@@ -16,11 +17,14 @@ use crate::config::Settings;
 use crate::state::AppState;
 
 /// Builds the full app: `/health` and `/__admin/*` are served by this gateway,
-/// everything else falls through to the proxy fallback.
+/// `/llm/*` by the embedded LLM sub-gateway, everything else falls through to
+/// the proxy fallback. `/llm` is a reserved prefix: routes mounted under it in
+/// `routes.toml` never win over the nest (ADR-L5).
 pub fn build_app(state: AppState) -> Router {
     Router::<AppState>::new()
         .route("/health", get(root_health))
         .nest("/__admin", admin::admin_router())
+        .nest("/llm", llm::llm_router())
         .fallback(proxy::proxy)
         .with_state(state)
 }
@@ -29,10 +33,12 @@ async fn root_health() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
 
-/// Loads the routes file, starts the health checker, and serves until shutdown.
+/// Loads the routes and providers files, starts the health checker, and serves
+/// until shutdown. Either file missing is not fatal (ADR-L10：两者独立加载）。
 pub async fn run(settings: Settings) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bind = settings.bind.clone();
     let routes_path = settings.routes_file.clone();
+    let providers_path = settings.providers_file.clone();
 
     let state = AppState::new(settings)?;
     let routes = config::load_routes(&routes_path)
@@ -41,6 +47,19 @@ pub async fn run(settings: Settings) -> Result<(), Box<dyn std::error::Error + S
     state.routes.set_all(routes);
     tracing::info!("loaded {count} route(s) from {}", routes_path.display());
 
+    let providers = config::load_providers(&providers_path).map_err(|e| {
+        format!(
+            "failed to load providers from {}: {e}",
+            providers_path.display()
+        )
+    })?;
+    let count = providers.len();
+    state.providers.set_all(providers);
+    tracing::info!(
+        "loaded {count} provider(s) from {}",
+        providers_path.display()
+    );
+
     health::spawn(state.clone());
 
     let app = build_app(state);
@@ -48,6 +67,7 @@ pub async fn run(settings: Settings) -> Result<(), Box<dyn std::error::Error + S
     let addr = listener.local_addr()?;
     tracing::info!("top-gateway listening on http://{addr}");
     tracing::info!("admin API at http://{addr}/__admin, docs: GET /__admin/routes");
+    tracing::info!("LLM sub-gateway at http://{addr}/llm/{{openai,anthropic,systemone}}/...");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

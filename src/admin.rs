@@ -55,9 +55,10 @@ pub fn admin_router() -> Router<AppState> {
         .route("/health", get(get_health))
         .route("/metrics", get(get_metrics))
         .route("/probe", post(trigger_probe))
+        .nest("/llm", crate::llm::admin::admin_router())
 }
 
-fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+pub(crate) fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     let Some(key) = &state.settings.admin_key else {
         return Ok(());
     };

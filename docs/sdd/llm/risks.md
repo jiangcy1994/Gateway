@@ -1,0 +1,15 @@
+# 风险登记（LLM 子网关）
+
+> **SDD 第 6 步**：评估前 5 步定下来的系统。每条风险必须有「怎么验证」。
+
+| # | 风险 | 影响 | 缓解 | 怎么验证 |
+|---|---|---|---|---|
+| R1 | **TPM 记账是 best-effort**：无 `usage` 字段（模型/供应商不返回）、流被中断、或 tail 缓冲（64 KiB）没覆盖到 usage 时记 0，TPM 计量偏低 | 配额比实际宽松，窗口末端可能轻微超限 | 限额配置留余量；`extract_tokens` 对无 usage 情况显式记 0 条而非静默跳过（`record_tokens(0)`），使请求次数仍精确 | 单测 + 集成测试 `llm_usage_missing_records_zero_tokens`；`llm_counts_tokens_from_streaming_final_chunk` 覆盖 SSE 末尾 usage |
+| R2 | **在途请求令牌未预留**：派遣时只扣 RPM，token 要等响应回来才入账 | 高并发 + 大 TPM 限额时窗口内实际占用被低估 | 可接受（LLM 响应延迟通常 << 60s 窗口）；后续可加预估预扣 | 集成测试：同一供应商并发发若干请求后查 `/__admin/llm/quota` 的 `tpm.used` 与已完成响应累计一致 |
+| R3 | **加权随机的短样本波动**：权重 0.9 / 0.1 的两个供应商，10 次请求里小权重者可能一次都没选到（的概率约 35%） | 分布式流量在分钟级自然均衡，单测样本不可作为分布断言 | 测试只钉确定性边界（权重为 0 即排除、耗尽即 429、全满前不误拒） | `llm_exhausted_provider_falls_back_to_remaining`、`llm_rpm_exhaustion_returns_429` |
+| R4 | **错误体非原生协议格式**：OpenAI/Anthropic SDK 收到 429/502 时走通用错误分支，拿不到原生 `error.type` 等字段 | SDK 侧的错误处理代码要按状态码而非错误体结构写 | house 格式 `{"error":{"code","message"}}` 信息足够 SDK 按 status code 重试；已写入 overview 非功能约束 | 集成测试断言 429/503/404 体为此格式 |
+| R5 | **`/llm/*` 无客户端鉴权 + api_key 明文**（ADR-L11） | 能访问端口者可消耗全部供应商配额；`GET /__admin/llm/providers` 泄露 key | 部署侧：绑回环、前置反加鉴权、设 `GATEWAY_ADMIN_KEY`；README 环境变量表注明 | 回归测试 `llm_admin_llm_endpoints_require_admin_key`（仅钉管理端点鉴权）；残留风险记录于 ADR-L11 |
+| R6 | **全满即 429，无排队**：客户端看到 429 的时间窗内所有供应商都在限额内 | 高峰期瞬时拒绝；客户端需自带退避重试 | 与需求「全满返 429」一致；`Retry-After` 头未在 v1 提供（后续可加，窗口剩余时间可算） | 集成测试 `llm_rpm_exhaustion_returns_429` 钉住语义 |
+| R7 | **无失败转移**（ADR-L7）：单供应商故障 → 502 | 挂多家供应商并不能躲开单家故障 | 监控 `/__admin/llm/metrics` 的 errors 计数及时下线故障供应商（`PUT` 设 `enabled:false`）；客户端重试会落到其他仍有配额的供应商 | `llm_unreachable_provider_returns_502` |
+| R8 | **`Systemone` 计量桩**（ADR-L8） | SystemOne 供应商的 TPM 计量恒为 0，按 TPM 的加权对其无效 | 桩行为有测试钉住；规格明确后只改 `usage.rs` 一个函数 | `llm_systemone_stub_forwards_without_token_counting` |
+| R9 | **同一供应商被多协议误配**：`protocol` 字段决定选择池，配错协议的供应商会被打到它不支持的协议路径 | 上游返回 4xx，透传给客户端 | `ProviderInput.protocol` 必填且校验；`x-llm-provider` 响应头让排错时能看到实际打到哪家 | `llm_forwards_openai_path_and_bearer_key` 断言响应头 |
