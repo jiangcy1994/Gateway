@@ -52,3 +52,18 @@
 - 影响：契约文档失去权威性，实现者依据错误签名工作
 - 缓解：`interfaces.md` 定为实现唯一权威；`docs/design.md` 维护声明要求「接口变更先改 interfaces.md 再改代码」；TDD 循环以契约为准写断言
 - 验证：`cargo test`（17 条集成测试）+ `cargo clippy --all-targets` 保持零警告；人工评审任何 PR 时对照 `interfaces.md` 的状态码表与 `match_route` 契约
+
+## R8 服务模式下 `GATEWAY_ADMIN_KEY` 明文落在 `%ProgramData%`
+
+- 可能性：必然发生（服务进程不继承用户环境，`gateway.env` 是唯一环境来源，见 ADR-012）
+- 影响：任何能读取该文件的本地用户/进程可拿到管理密钥，进而增删路由、查看上游地址；风险等级与 `providers.toml` 里的明文 `api_key`（ADR-L11）相同
+- 缓解：`install` 只生成带 `change-me` 的模板，不写入真实密钥；依赖 `%ProgramData%` 的默认 ACL（Administrators/System 可写，普通用户只读）限制访问；部署后应立即改为高熵值并通过管理 API 验证；密钥不进版本管理
+- 验证：install 后检查模板内容为占位值；`icacls "%ProgramData%\top-gateway"` 确认普通用户无写权限；`GET /__admin/routes` 不带 key 返回 401
+
+## R9 SCM 注册/停止的实机生命周期尚未在本机验证
+
+- 可能性：当前为既成事实（开发 shell 非管理员，无法 `install`/`start`）
+- 影响：服务壳代码（`src/service.rs`）只经过了编译、`run`/`status`（未安装路径）与网关本体的回归验证；`service_main` 的状态上报、Stop 注入 `run_with_shutdown` 的真实路径未经 SCM 触发
+- 缓解：状态机完全由 `windows-service` 0.7 的类型约束（`ServiceStatus`/`ServiceExitCode`）撑起，网关本体复用已测的 `run_with_shutdown`；接口契约已写入 `interfaces.md` 的 service.rs 节，验证步骤明确
+- 验证（需管理员 PowerShell）：`top-gateway install && top-gateway start`，`status` 期望 `Running` 且 `curl /health` 返回 `{"status":"ok"}`；`top-gateway stop` 后 `status` 期望 `Stopped`（退出码 0），服务基目录下 `top-gateway.log` 含完整启动/关闭记录；最后 `uninstall`
+

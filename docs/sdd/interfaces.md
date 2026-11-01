@@ -16,11 +16,19 @@
 
 ### `run(settings: Settings) -> Result<(), Box<dyn Error + Send + Sync>>`
 
-进程主体。
+进程主体（控制台模式）。
 
 - 前置：`settings` 由 `Settings::from_env()` 构造。
 - 后置：加载路由文件（缺失不致命，告警后以零路由启动）→ `health::spawn`（首轮立即执行）→ 绑定 `settings.bind` → 阻塞服务直到 Ctrl+C / SIGTERM，再优雅关闭。
 - 错误：路由文件解析失败、客户端构建失败、绑定失败均向上传播。
+
+### `run_with_shutdown(settings: Settings, shutdown: BoxFuture<'static, ()>) -> Result<(), Box<dyn Error + Send + Sync>>`
+
+`run` 的可参数化版本：关闭信号由调用方提供（`run` 即「Ctrl+C / SIGTERM」）。
+
+- 前置：`shutdown` resolve 恰好一次；resolve 前 axum 持续接收连接。
+- 后置：`shutdown` resolve 后停止接受新连接，等待在途连接结束（axum graceful shutdown）。
+- 错误：同 `run`。**Windows 服务外壳（`service.rs`）用它把 `SERVICE_CONTROL_STOP` 接进同一个优雅关闭路径**，网关本体不感知 SCM。
 
 ---
 
@@ -144,12 +152,24 @@ fallback 处理器，所有非 `/health`、非 `/__admin/*` 请求都到这里�
 |---|---|---|---|
 | `GATEWAY_BIND` | `bind` | `127.0.0.1:8000` | 监听地址 |
 | `GATEWAY_ADMIN_KEY` | `admin_key` | `None` | 未设置或空串 → 端点开放 + 启动告警 |
-| `GATEWAY_ROUTES_FILE` | `routes_file` | `routes.toml` | 路由文件路径 |
+| `GATEWAY_ROUTES_FILE` | `routes_file` | `routes.toml` | 路由文件路径；相对路径按 `base_dir()` 解析 |
+| `GATEWAY_PROVIDERS_FILE` | `providers_file` | `providers.toml` | 供应商文件路径；同上 |
 | `GATEWAY_HEALTH_INTERVAL_SECS` | `health_interval_secs` | `10` | 非正数回落默认 |
 | `GATEWAY_HEALTH_TIMEOUT_SECS` | `health_timeout_secs` | `2` | 单次探测超时 |
 | `GATEWAY_DEFAULT_TIMEOUT_SECS` | `default_timeout_secs` | `30` | 路由无 `timeout_secs` 时使用 |
 
-- 后置：`admin_key` 为空串时视为未设置（过滤）。
+- 后置：`admin_key` 为空串时视为未设置（过滤）；相对路径的配置文件解析为 `base_dir()` 下的绝对路径（`GATEWAY_BASE_DIR` 未设 → 当前工作目录，控制台行为不变）。
+
+### `base_dir_or(default: &Path) -> PathBuf` / `base_dir() -> PathBuf`
+
+- 前置：无。
+- 后置：`GATEWAY_BASE_DIR` 非空 → 该值；否则 `default`（`base_dir()` 传入 cwd）。供控制台（cwd）与 Windows 服务（`%ProgramData%\top-gateway`）共用。
+
+### `load_env_file(path: &Path) -> Result<(), io::Error>`
+
+- 前置：无。
+- 后置：文件不存在 → `Ok(())`（no-op）；存在则逐行 `KEY=VALUE` 应用到进程环境（`#` 注释 / 空行跳过，值去引号），解析失败的行只告警不中断。
+- 错误：除 NotFound 外的读取 IO 错误向上传播；调用方（服务外壳）按 best-effort 处理。
 
 ### `load_routes(path: &Path) -> Result<Vec<Route>, ApiError>`
 
@@ -215,6 +235,43 @@ fallback 处理器，所有非 `/health`、非 `/__admin/*` 请求都到这里�
 | `Internal(ctx)` | 500 | 客户端构建失败、`/probe` 探测失败 |
 
 所有错误体统一为 `{"error":{"code":<u16>,"message":<thiserror 文本>}}`。
+
+---
+
+## service.rs（仅 Windows）
+
+Windows 服务外壳，`cfg(windows)` 编译；非 Windows 平台二进制是普通控制台程序（见 `main.rs`）。**网关本体不感知 SCM**——外壳只负责状态上报、日志与把停止信号接进 `run_with_shutdown`（ADR-S1）。
+
+### `dispatch() -> Result<i32, ShellError>`（`main` 的唯一调用）
+
+按第一个参数分派，返回进程退出码：
+
+| 调用 | 行为 |
+|---|---|
+| 无参数 | 服务模式：`service_dispatcher::start` 连接 SCM，在 SCM 线程回调 `service_main`；控制台直接双击启动会报 1063 错误并提示 `run` / `install` |
+| `run` / `console` | 前台运行，与 non-Windows 构建一致（stdout 日志、Ctrl+C、配置相对 cwd） |
+| `install [--autostart]` | 注册服务（OWN_PROCESS / LocalSystem / `error_control=Normal`）；建 `%ProgramData%\top-gateway`，从 exe 同目录补种缺失的 `routes.toml` / `providers.toml`，写 `gateway.env` 模板 |
+| `uninstall` | 必须先 Stopped，否则 400 级提示；删除后配置文件保留 |
+| `start` / `stop` | `stop` 在请求被接受后轮询 `query_status` 直到 Stopped（上限 30s），等服务真正排空在途连接 |
+| `status` | 打印状态/PID/退出码；退出码 0=运行中，1=其他，供脚本使用 |
+
+### 服务生命周期（`service_main` → `run_service`）
+
+1. 注册控制处理器：`Interrogate` → NoError；`Stop` → oneshot 发出停止信号（`FnMut` + `Mutex<Option<Sender>>` 保证只发一次）。系统关机**不**接受（`controls_accepted` 仅 STOP）——SCM 关机时限内排空代理请求只会拖延关机（ADR-S3）。
+2. `StartPending`（wait_hint 10s）→ 解析 base dir → 应用 `gateway.env`（best-effort）→ `logging::init_file`（滚动日志，缺失目录即终止并报 Stopped+1）→ `Running`。
+3. 多线程 tokio runtime 上 `run_with_shutdown(Settings::from_env(), stop_rx)`。
+4. 结束后冲刷日志 guard，上报 `Stopped` + 退出码（0/1）。
+
+## logging.rs（仅 `init_file` 限 Windows）
+
+### `init_console()`
+
+stdout + `EnvFilter`（默认 `top_gateway=info,warn`，`RUST_LOG` 覆盖）。
+
+### `init_file(dir: &Path) -> Result<LogGuard, io::Error>`
+
+- 前置：`dir` 存在且可写（服务外壳负责创建）。
+- 后置：`tracing-appender` 按日滚动 `top-gateway.log`（旧文件带日期后缀），非阻塞写；`LogGuard` drop 时冲刷——服务进程须持有它到关闭完成。
 
 ## 测试以本文件为准
 

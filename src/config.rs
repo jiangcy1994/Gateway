@@ -29,8 +29,67 @@ pub struct Settings {
     pub default_timeout_secs: u64,
 }
 
+/// Directory that relative config-file paths resolve against: `GATEWAY_BASE_DIR`
+/// if set, otherwise the current directory. Console behavior is unchanged; the
+/// Windows service shell pins this to its own base directory before settings
+/// are constructed, because a service's working directory is `C:\Windows\System32`.
+pub fn base_dir() -> std::path::PathBuf {
+    base_dir_or(&std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")))
+}
+
+/// `GATEWAY_BASE_DIR` if set (non-empty), else `default`. Shared by the console
+/// default (cwd) and the service default (`%ProgramData%\top-gateway`).
+pub fn base_dir_or(default: &std::path::Path) -> std::path::PathBuf {
+    std::env::var("GATEWAY_BASE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| default.to_path_buf())
+}
+
+fn resolve_path(env_name: &str, default: &str, base: &std::path::Path) -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(std::env::var(env_name).unwrap_or_else(|_| default.into()));
+    if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    }
+}
+
+/// Applies a `KEY=VALUE` file to the process environment. A missing file is a
+/// no-op; unparseable lines are warned about and skipped, never fatal. Used in
+/// Windows service mode, where the process does not inherit the installer's
+/// environment — the service reads `GATEWAY_*` settings from `gateway.env` in
+/// the base directory instead.
+pub fn load_env_file(path: &std::path::Path) -> Result<(), std::io::Error> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for (idx, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            tracing::warn!("{}:{}: no '=' — line ignored", path.display(), idx + 1);
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim().trim_matches('"');
+        if key.is_empty() {
+            tracing::warn!("{}:{}: empty key — line ignored", path.display(), idx + 1);
+            continue;
+        }
+        std::env::set_var(key, value);
+    }
+    Ok(())
+}
+
 impl Settings {
     pub fn from_env() -> Self {
+        let base = base_dir();
         let admin_key = std::env::var("GATEWAY_ADMIN_KEY")
             .ok()
             .filter(|s| !s.is_empty());
@@ -40,12 +99,8 @@ impl Settings {
         Self {
             bind: std::env::var("GATEWAY_BIND").unwrap_or_else(|_| "127.0.0.1:8000".into()),
             admin_key,
-            routes_file: std::path::PathBuf::from(
-                std::env::var("GATEWAY_ROUTES_FILE").unwrap_or_else(|_| "routes.toml".into()),
-            ),
-            providers_file: std::path::PathBuf::from(
-                std::env::var("GATEWAY_PROVIDERS_FILE").unwrap_or_else(|_| "providers.toml".into()),
-            ),
+            routes_file: resolve_path("GATEWAY_ROUTES_FILE", "routes.toml", &base),
+            providers_file: resolve_path("GATEWAY_PROVIDERS_FILE", "providers.toml", &base),
             health_interval_secs: env_u64("GATEWAY_HEALTH_INTERVAL_SECS", 10),
             health_timeout_secs: env_u64("GATEWAY_HEALTH_TIMEOUT_SECS", 2),
             default_timeout_secs: env_u64("GATEWAY_DEFAULT_TIMEOUT_SECS", 30),
@@ -157,4 +212,54 @@ pub fn save_providers(path: &std::path::Path, providers: &[Provider]) -> Result<
     tmp.persist(path)
         .map_err(|e| ApiError::Persist(format!("replace {}: {e}", path.display())))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_file_applies_values_and_skips_noise() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gateway.env");
+        std::fs::write(
+            &path,
+            "# comment\n\n   \nGATEWAY_UNIT_TEST_KEY=abc\nGATEWAY_UNIT_TEST_QUOTED=\"with spaces\"\nNO_EQUALS_HERE\n=GATEWAY_UNIT_TEST_BAD\nGATEWAY_UNIT_TEST_EMPTY=\n",
+        )
+        .unwrap();
+        load_env_file(&path).unwrap();
+        assert_eq!(std::env::var("GATEWAY_UNIT_TEST_KEY").unwrap(), "abc");
+        assert_eq!(
+            std::env::var("GATEWAY_UNIT_TEST_QUOTED").unwrap(),
+            "with spaces"
+        );
+        assert!(std::env::var("GATEWAY_UNIT_TEST_BAD").is_err());
+        assert_eq!(std::env::var("GATEWAY_UNIT_TEST_EMPTY").unwrap(), "");
+    }
+
+    #[test]
+    fn env_file_missing_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        load_env_file(&dir.path().join("does-not-exist.env")).unwrap();
+    }
+
+    #[test]
+    fn relative_paths_resolve_against_base() {
+        let base = std::path::Path::new("/gw/conf");
+        assert_eq!(
+            resolve_path("GATEWAY_ROUTES_FILE", "routes.toml", base),
+            base.join("routes.toml")
+        );
+    }
+
+    #[test]
+    fn absolute_paths_stay_absolute() {
+        let base = std::path::Path::new("/gw/conf");
+        std::env::set_var("GATEWAY_UNIT_TEST_ABS", "/etc/routes.toml");
+        assert_eq!(
+            resolve_path("GATEWAY_UNIT_TEST_ABS", "routes.toml", base),
+            std::path::PathBuf::from("/etc/routes.toml")
+        );
+        std::env::remove_var("GATEWAY_UNIT_TEST_ABS");
+    }
 }

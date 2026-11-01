@@ -137,3 +137,52 @@ LLM 管理端点（同样需要 `X-Admin-Key`）：
 
 每次经管理 API 的路由变更都会原子写回 `GATEWAY_ROUTES_FILE`（临时文件 +
 rename），重启不丢失；注意重写会丢弃文件里的注释。
+
+## 部署为 Windows 服务
+
+同一份二进制既是控制台程序也是服务程序：SCM 不带参数启动它即进入服务模式，
+`install / start / stop / status / uninstall` 是管理控制台。全部命令需要
+管理员权限。
+
+```powershell
+.\target\release\top-gateway.exe install            # 注册为按需启动的服务
+.\target\release\top-gateway.exe install --autostart # 开机自启
+.\target\release\top-gateway.exe start
+.\target\release\top-gateway.exe status              # 打印状态；退出码 0 = 运行中
+.\target\release\top-gateway.exe stop                # 等待在途连接排空（最长 30s）
+.\target\release\top-gateway.exe uninstall           # 需先停止；配置文件保留
+.\target\release\top-gateway.exe run                 # 前台运行（等同非 Windows 构建）
+```
+
+服务以 LocalSystem 身份运行，工作目录是 `C:\Windows\System32`，也不继承用户
+环境变量，因此配置与日志固定在服务基目录，而不是 cwd：
+
+```
+%ProgramData%\top-gateway\
+  ├─ routes.toml       # install 时从 exe 同目录补种缺失文件，之后由管理 API 维护
+  ├─ providers.toml
+  ├─ gateway.env       # KEY=VALUE，服务进程的唯一环境来源（install 时生成模板）
+  └─ top-gateway.log   # 按日滚动（旧文件带日期后缀）
+```
+
+`gateway.env` 模板（**请填入真实密钥**——服务不读注册表，也不读用户环境变量）：
+
+```
+GATEWAY_ADMIN_KEY=change-me
+GATEWAY_BIND=0.0.0.0:8000
+# RUST_LOG=top_gateway=info
+```
+
+注意事项：
+
+- 相对路径的 `GATEWAY_ROUTES_FILE` / `GATEWAY_PROVIDERS_FILE` 在服务模式下
+  解析到服务基目录；控制台模式仍按 cwd 解析，行为不变。`GATEWAY_BASE_DIR`
+  可覆盖基目录位置。
+- 直接双击服务模式的 exe（无参数、未连上 SCM）会报 1063 错误并提示用
+  `run` / `install`。
+- 服务只接受 `SERVICE_CONTROL_STOP`，不接受系统关机通知——在关机时限内排空
+  代理请求只会拖延关机（ADR-013）。
+- `gateway.env` 里的 `GATEWAY_ADMIN_KEY` 是明文，和 `providers.toml` 里的
+  `api_key` 一样（ADR-012 / ADR-L11）：依靠 %ProgramData% 的默认 ACL 限制
+  访问，不要把密钥写进交给版本管理的模板。
+

@@ -3,10 +3,17 @@ pub mod config;
 pub mod error;
 pub mod health;
 pub mod llm;
+pub mod logging;
 pub mod metrics;
 pub mod proxy;
 pub mod router;
 pub mod state;
+
+/// Windows service shell (`src/service.rs`): SCM entry, status reporting, and
+/// the `install`/`start`/`stop`/`uninstall`/`status` management commands. Absent
+/// on other targets, where the binary is a plain console app.
+#[cfg(windows)]
+pub mod service;
 
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -34,8 +41,20 @@ async fn root_health() -> impl IntoResponse {
 }
 
 /// Loads the routes and providers files, starts the health checker, and serves
-/// until shutdown. Either file missing is not fatal (ADR-L10：两者独立加载）。
+/// until Ctrl+C (or SIGTERM on Unix). See `run_with_shutdown` — the Windows
+/// service shell reuses the latter to drive shutdown from the service control
+/// manager.
 pub async fn run(settings: Settings) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_with_shutdown(settings, Box::pin(shutdown_signal())).await
+}
+
+/// Same as `run`, but the caller supplies the shutdown trigger. The future must
+/// resolve exactly once; on resolution `axum::serve` stops accepting and waits
+/// for in-flight connections to finish (graceful shutdown).
+pub async fn run_with_shutdown(
+    settings: Settings,
+    shutdown: futures_util::future::BoxFuture<'static, ()>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bind = settings.bind.clone();
     let routes_path = settings.routes_file.clone();
     let providers_path = settings.providers_file.clone();
@@ -70,7 +89,7 @@ pub async fn run(settings: Settings) -> Result<(), Box<dyn std::error::Error + S
     tracing::info!("LLM sub-gateway at http://{addr}/llm/{{openai,anthropic,systemone}}/...");
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown)
         .await?;
 
     tracing::info!("shutdown complete");

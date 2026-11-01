@@ -20,5 +20,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 
+# Windows service shell (src/service.rs); a no-op on other targets.
+[target.'cfg(windows)'.dependencies]
+tracing-appender = "0.2"
+windows-service = "0.7"
+
 [profile.release]
 lto = "thin"

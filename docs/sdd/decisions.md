@@ -75,3 +75,24 @@
 - 背景：「测试先行」不可只靠声明，否则无法区分真先行与事后补测试。
 - 决策：实现走红/绿/重构节奏，每个循环在 `../tdd/cycles.md` 留记录（意图/红/绿/重构），只记失败过的真循环。
 - 后果：过程可审计，代价是文档维护量；集成测试自包含（同进程起 mock 上游 + 真实网关）使该成本很低。
+
+## ADR-011 单一二进制双模式：SCM 无参启动 + 管理子命令
+
+- 状态：接受（2026-11-01）
+- 背景：需要可部署为 Windows 服务，同时保留原有控制台开发体验（`cargo run`、Ctrl+C、stdout 日志）。备选是拆 `top-gateway.exe` + `top-gateway-service.exe` 两个二进制。
+- 决策：一个 `top-gateway.exe`：无参数启动 = 服务模式（`service_dispatcher::start` 连接 SCM）；`run` = 前台运行；`install [--autostart]` / `start` / `stop` / `uninstall` / `status` = 服务管理（`src/service.rs`，`cfg(windows)`）。
+- 后果：部署只需拷一个 exe，服务与控制台必然同版本；`install` 以自身路径注册，不存在「注册的 exe 找不到」。代价是二进制变大（`windows-service`/`windows-sys` 依赖）且参数解析要区分「SCM 启动」与「双击启动」——后者以 1063 错误提示 `run`/`install`。非 Windows 平台 `main.rs` 仍是普通控制台程序，服务模块不编译。
+
+## ADR-012 服务配置/日志落在 `%ProgramData%\top-gateway`，经 `gateway.env` 取环境，不用注册表
+
+- 状态：接受（2026-11-01）
+- 背景：服务进程的工作目录是 `C:\Windows\System32`，且不继承安装者的环境变量——相对路径的 `routes.toml` 与 `GATEWAY_ADMIN_KEY` 都会「丢」。备选是把配置写进服务的 `Parameters` 注册表键。
+- 决策：基目录解析引入 `GATEWAY_BASE_DIR`（`config::base_dir_or`），服务默认 `%ProgramData%\top-gateway`，控制台默认 cwd（行为不变）；服务在基目录读 `gateway.env`（`KEY=VALUE`，缺失即 no-op）补齐 `GATEWAY_*`；日志用 `tracing-appender` 按日滚动写基目录（`logging::init_file`）。
+- 后果：配置是明文可审计的普通文件，可用现成工具编辑/ diff/ 备份，跨平台路径逻辑共用；`install` 自动建目录并从 exe 同目录补种缺失的 `routes.toml`/`providers.toml` 与 `gateway.env` 模板（从不覆盖已有文件）。代价：`gateway.env` 明文存 `GATEWAY_ADMIN_KEY`（与 `providers.toml` 明文 api_key 同一既定策略，ADR-L11；靠 NTFS 权限与回环绑定缓解），且改基目录需设系统级环境变量。
+
+## ADR-013 SCM 停止信号注入 `run_with_shutdown`，网关本体不感知 SCM
+
+- 状态：接受（2026-11-01）
+- 背景：优雅关闭（排空在途连接）的路径已经存在于 `axum::serve().with_graceful_shutdown(...)`；服务外壳不应重写一份服务器生命周期。
+- 决策：`lib::run` 拆出 `run_with_shutdown(settings, shutdown: BoxFuture)`，控制台仍用 Ctrl+C/SIGTERM，服务外壳把 `SERVICE_CONTROL_STOP` 的 oneshot 接进去；状态机按 `StartPending → Running → Stopped` 上报，失败时以 win32 退出码 1 报 Stopped。系统关机/断电控制**不**接受（`controls_accepted` 仅 STOP）。
+- 后果：关闭语义在两种模式下完全一致，测试可直接覆盖控制台路径；`Stop` 到 Stopped 之间允许 30s 排空（`stop` 子命令轮询），超时只是 Stopped 上报迟到、SCM 超时强杀。代价是系统关机时不做优雅排空——SCM 关机时限内排空被代理的请求只会拖延关机，进程被强杀是可接受的。
