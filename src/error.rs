@@ -1,0 +1,59 @@
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde_json::json;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ApiError {
+    #[error("route not found: {0}")]
+    RouteNotFound(String),
+
+    #[error("invalid route: {0}")]
+    InvalidRoute(String),
+
+    #[error("route id already exists: {0}")]
+    DuplicateId(String),
+
+    #[error("route prefix already mounted: {0}")]
+    DuplicatePrefix(String),
+
+    #[error("unauthorized: a valid X-Admin-Key is required")]
+    Unauthorized,
+
+    #[error("routes file could not be read: {0}")]
+    ConfigLoad(String),
+
+    #[error("routes file could not be written: {0}")]
+    Persist(String),
+
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+impl ApiError {
+    fn status(&self) -> StatusCode {
+        match self {
+            ApiError::RouteNotFound(_) => StatusCode::NOT_FOUND,
+            ApiError::InvalidRoute(_) | ApiError::DuplicateId(_) | ApiError::DuplicatePrefix(_) => {
+                StatusCode::BAD_REQUEST
+            }
+            ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
+            ApiError::ConfigLoad(_) | ApiError::Persist(_) | ApiError::Internal(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let status = self.status();
+        (
+            status,
+            Json(json!({
+                "error": { "code": status.as_u16(), "message": self.to_string() }
+            })),
+        )
+            .into_response()
+    }
+}

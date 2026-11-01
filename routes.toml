@@ -1,0 +1,30 @@
+# top-gateway routes
+# Managed file: edits here are picked up at startup, and every change made through
+# the /__admin API rewrites this file. Rewrites drop comments.
+#
+# prefix     - the path this sub-gateway is mounted under (must start with '/')
+# upstream   - where matching traffic is forwarded (http or https)
+# strip_prefix - drop the matched prefix before forwarding (default true)
+# enabled    - disabled routes return 503 (default true)
+# headers    - injected into every forwarded request, overriding client values
+# timeout_secs - per-route upstream timeout (default GATEWAY_DEFAULT_TIMEOUT_SECS=30)
+# health_path - upstream path probed by the health checker (default /health)
+
+[[routes]]
+id = "qqbot"
+prefix = "/qqbot"
+upstream = "http://127.0.0.1:8080"
+strip_prefix = true
+enabled = true
+description = "QQ Bot API gateway (qqbot-api-gateway)"
+
+[routes.headers]
+# x-gateway-key = "replace-with-the-sub-gateway's-key"
+
+[[routes]]
+id = "qqbot-admin"
+prefix = "/qqbot-admin"
+upstream = "http://127.0.0.1:8081"
+strip_prefix = true
+enabled = true
+description = "admin panel behind the QQ Bot gateways"
