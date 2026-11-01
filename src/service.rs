@@ -249,7 +249,10 @@ fn install(extra: &[String]) -> Result<i32, ShellError> {
         "  config dir : {} (routes.toml / providers.toml / gateway.env)",
         base.display()
     );
-    println!("  log file   : {}", base.join("top-gateway.log").display());
+    println!(
+        "  log file   : {} (top-gateway.log.YYYY-MM-DD, rotated daily)",
+        base.display()
+    );
     println!();
     print!("next: edit `gateway.env` (set GATEWAY_ADMIN_KEY at minimum), then `top-gateway start`");
     println!();

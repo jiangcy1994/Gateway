@@ -162,7 +162,7 @@ rename），重启不丢失；注意重写会丢弃文件里的注释。
   ├─ routes.toml       # install 时从 exe 同目录补种缺失文件，之后由管理 API 维护
   ├─ providers.toml
   ├─ gateway.env       # KEY=VALUE，服务进程的唯一环境来源（install 时生成模板）
-  └─ top-gateway.log   # 按日滚动（旧文件带日期后缀）
+  └─ top-gateway.log.YYYY-MM-DD   # 按日滚动（当前文件即带日期后缀）
 ```
 
 `gateway.env` 模板（**请填入真实密钥**——服务不读注册表，也不读用户环境变量）：

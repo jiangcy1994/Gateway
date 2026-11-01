@@ -271,7 +271,7 @@ stdout + `EnvFilter`（默认 `top_gateway=info,warn`，`RUST_LOG` 覆盖）。
 ### `init_file(dir: &Path) -> Result<LogGuard, io::Error>`
 
 - 前置：`dir` 存在且可写（服务外壳负责创建）。
-- 后置：`tracing-appender` 按日滚动 `top-gateway.log`（旧文件带日期后缀），非阻塞写；`LogGuard` drop 时冲刷——服务进程须持有它到关闭完成。
+- 后置：`tracing-appender` 按日滚动 `top-gateway.log.YYYY-MM-DD`（当前文件即带日期后缀，零点滚到下一天）；非阻塞写；`LogGuard` drop 时冲刷——服务进程须持有它到关闭完成。
 
 ## 测试以本文件为准
 

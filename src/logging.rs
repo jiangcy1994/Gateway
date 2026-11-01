@@ -27,10 +27,11 @@ mod file_appender {
         _guard: tracing_appender::non_blocking::WorkerGuard,
     }
 
-    /// Initializes rolling daily file logging under `dir` (`top-gateway.log`,
-    /// rotated files get a `.YYYY-MM-DD` suffix). A missing or unwritable
-    /// directory is an error: logging is the only way to observe a broken
-    /// service, so the caller (service shell) surfaces the failure to the SCM.
+    /// Initializes rolling daily file logging under `dir` (`top-gateway.log.YYYY-MM-DD`;
+    /// the current file always carries the date suffix, rotation happens at midnight).
+    /// A missing or unwritable directory is an error: logging is the only way to
+    /// observe a broken service, so the caller (service shell) surfaces the failure
+    /// to the SCM.
     pub fn init_file(dir: &Path) -> Result<LogGuard, std::io::Error> {
         let file = tracing_appender::rolling::daily(dir, "top-gateway.log");
         let (writer, guard) = tracing_appender::non_blocking(file);
