@@ -45,10 +45,11 @@ const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 
 /// winapi error codes we surface as friendly messages instead of raw errors.
 /// 1060 = ERROR_SERVICE_DOES_NOT_EXIST, 1062 = ERROR_SERVICE_NOT_ACTIVE,
-/// 1063 = ERROR_FAILED_SERVICE_CONTROLLER_CONNECT.
+/// 1063 = ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, 5 = ERROR_ACCESS_DENIED.
 const C_SERVICE_DOES_NOT_EXIST: i32 = 1060;
 const C_SERVICE_NOT_ACTIVE: i32 = 1062;
 const C_NO_SERVICE_CONTROLLER: i32 = 1063;
+const C_ACCESS_DENIED: i32 = 5;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -62,6 +63,11 @@ pub enum ShellError {
 impl fmt::Display for ShellError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            // `windows_service::Error`'s own Display drops the OS error code;
+            // print the inner io::Error instead so "os error 5" is visible.
+            ShellError::Service(windows_service::Error::Winapi(io)) => {
+                write!(f, "winapi call failed: {io}")
+            }
             ShellError::Service(e) => write!(f, "{e}"),
             ShellError::Io(e) => write!(f, "{e}"),
             ShellError::Message(m) => write!(f, "{m}"),
@@ -73,7 +79,23 @@ impl std::error::Error for ShellError {}
 
 impl From<windows_service::Error> for ShellError {
     fn from(e: windows_service::Error) -> Self {
-        ShellError::Service(e)
+        match access_denied_hint(&e) {
+            Some(msg) => ShellError::Message(msg),
+            None => ShellError::Service(e),
+        }
+    }
+}
+
+/// Non-elevated shells get ERROR_ACCESS_DENIED from the SCM on every management
+/// command; make that a plain instruction instead of a bare winapi error.
+fn access_denied_hint(e: &windows_service::Error) -> Option<String> {
+    match e {
+        windows_service::Error::Winapi(io) if io.raw_os_error() == Some(C_ACCESS_DENIED) => Some(
+            "access denied (os error 5) — service commands require an elevated \
+                 (administrator) prompt; run them from an administrator PowerShell"
+                .to_string(),
+        ),
+        _ => None,
     }
 }
 
@@ -168,7 +190,7 @@ fn open_service(
         .open_service(SERVICE_NAME, access)
         .map_err(|e| match not_installed(&e) {
             Some(msg) => ShellError::Message(msg),
-            None => ShellError::Service(e),
+            None => ShellError::from(e),
         })
 }
 
