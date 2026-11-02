@@ -697,6 +697,25 @@ mod tests {
         assert!(!b.ws_needs_connection());
     }
 
+    /// `to_string_pretty` omits `None` keys rather than writing empty strings
+    /// (data-model.md 持久化形态以此为据）。手工编辑写空串也被 `normalize`
+    /// 收敛，两种形态读回都成 `None`。
+    #[test]
+    fn toml_omits_none_option_keys() {
+        let text = toml::to_string_pretty(&BotsFile { bots: vec![bot()] }).unwrap();
+        assert!(!text.contains("api_base"));
+        assert!(!text.contains("ws_url"));
+        assert!(!text.contains("event_secret"));
+        assert!(text.contains("event_url"));
+        // Hand-written empty strings converge to the same `None` on load.
+        let hand = text.replace(
+            "event_url = \"http://127.0.0.1:9000/qq/events\"",
+            "api_base = \"\"\nevent_url = \"http://127.0.0.1:9000/qq/events\"",
+        );
+        let back: BotsFile = toml::from_str(&hand).unwrap();
+        assert_eq!(back.bots[0].clone().normalize().api_base, None);
+    }
+
     #[test]
     fn event_source_serializes_lowercase() {
         assert_eq!(

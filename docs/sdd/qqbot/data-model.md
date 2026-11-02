@@ -145,17 +145,14 @@ name = "群答疑机器人"
 app_id = "1020304050"
 app_secret = "DG5g3B4j9X2KOErG"
 sandbox = false
-api_base = ""
-ws_url = ""
-intents = 67108864            # (1<<25) | (1<<26)
+intents = 100663296           # (1<<25) | (1<<26)
 shard = [0, 1]
 event_source = "webhook"
 event_url = "http://127.0.0.1:9000/qq/events"
-event_secret = ""
 enabled = true
 ```
 
-`BotsFile { bots: Vec<Bot> }` → `toml::to_string_pretty`；原子替换语义与 routes / providers 文件相同（同目录临时文件 + rename，重写丢注释）。Option 字段在 TOML 里序列化为空串（`to_string_pretty` 不跳过 `None`，空串 round-trip 时由 `default` 归一化）；JSON 管理 API 中保持 `null`。`app_secret` 以明文落盘（与 `Provider.api_key` 同策略，ADR-Q11）。
+`BotsFile { bots: Vec<Bot> }` → `toml::to_string_pretty`；原子替换语义与 routes / providers 文件相同（同目录临时文件 + rename，重写丢注释）。值为 `None` 的 Option 字段（上例的 `api_base` / `ws_url` / `event_secret`）**在 TOML 里被整体省略**（`to_string_pretty` 跳过 `None` 键，不是写成空串——已被 `toml_omits_none_option_keys` 测试钉住），读回时经 `serde(default)` + `Bot::normalize` 归一化为 `None`；JSON 管理 API 中 `None` 保持 `null`，`Some("")` 在 `normalize` 里也被收敛为 `None`（空串等同未设）。`app_secret` 以明文落盘（与 `Provider.api_key` 同策略，ADR-Q11）。
 
 ## 数据流上的形态
 

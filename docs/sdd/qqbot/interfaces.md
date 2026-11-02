@@ -10,11 +10,11 @@
 
 ### `EventSource`（枚举）
 
-变体 `Webhook` / `Websocket`；serde 小写字符串 `"webhook"` / `"websocket"`；实现 `FromStr`（TOML / JSON 错误表示未知值）。
+变体 `Webhook` / `Websocket`；serde 小写字符串 `"webhook"` / `"websocket"`；`Webhook` 为 `#[default]`；实现 `Display`（日志用）。未知值由 serde 报错，不实现 `FromStr`。
 
 ### `Bot`（结构体）
 
-字段与不变式见 `data-model.md`（Q1–Q7）。实现 `Serialize/Deserialize`（TOML 与 JSON 共用同一结构；TOML 中 Option 字段序列化为空串，反序列化时空串经 `default` 归一化为 `None`）。
+字段与不变式见 `data-model.md`（Q1–Q7）。实现 `Serialize/Deserialize`（TOML 与 JSON 共用同一结构；TOML 中 `None` 的 Option 字段被序列化时整体省略，空串在 `normalize` 里归一化为 `None`）。
 
 ### `Bot::validate(&self) -> Result<(), String>`
 
@@ -28,9 +28,9 @@
 
 ### `Bot::apply_patch(&self, patch: BotPatch) -> Bot`
 
-- 后置：`Some` 字段覆盖，`None` 保留；**`id` 永远来自 `self`**；不校验（调用方 `replace` 前调 `validate`）。
+- 后置：`Some` 字段覆盖，`None` 保留；**`id` 永远来自 `self`**；返回值经 `normalize()`（trim 空白、空串 Option → `None`）；不校验（调用方 `replace` 前调 `validate`）。
 
-### `BotTable::{set_all, list, get, find, find_enabled, add, replace, remove}`
+### `BotTable::{set_all, list, get, find, add, replace, remove}`
 
 | 方法 | 签名 | 后置 | 错误 |
 |---|---|---|---|
@@ -42,7 +42,8 @@
 | `replace` | `(&self, id: &str, Bot) -> Result<(), ApiError>` | 原地替换 | `BotNotFound`（404）/ 重复 id 或 app_id（排除自身位置后比较，400） |
 | `remove` | `(&self, id: &str) -> Option<Bot>` | 移除并返回 | 不抛 |
 
-- `app_id` 上的唯一性是 QQ Bot 特有约束（平台身份不能二代）：`find` / `find_enabled` 的存在意义即「app_id 是转发与回调的路由键」。
+- `app_id` 上的唯一性是 QQ Bot 特有约束（平台身份不能二代）：`find` 的存在意义即「app_id 是转发与回调的路由键」。
+- 表**不**提供 `find_enabled`：disabled 与不存在是两种状态，转发路径用 `find` + 显式 `enabled` 检查区分（503 vs 404），回调路径统一 404（ADR-Q8）。一个 `Option<Bot>` 无法承载这个区分，所以不做一个方法。
 
 ---
 
@@ -54,7 +55,7 @@
 
 | 方法 | 签名 | 调用方 | 后置 / 错误 |
 |---|---|---|---|
-| `get_or_fetch` | `(&self, client: &Client, bot: &Bot) -> Result<String, ApiError>` | forward、ws supervisor | 见下面判定顺序 |
+| `get_or_fetch` | `(&self, client: &Client, bot: &Bot, timeout: Duration) -> Result<String, ApiError>` | forward、ws supervisor（两者传 `settings.default_timeout_secs`） | 见下面判定顺序 |
 | `invalidate` | `(&self, app_id: &str)` | ws supervisor 收到 401 类关闭码后 | 清掉当前 token，下次强制刷新 |
 
 ### `get_or_fetch` 判定顺序（实现严格按此）
@@ -68,9 +69,9 @@
      - 失败 → 告警并返回旧 token（旧 token 仍有效；若已过期则 `Err`）。
 3. 无 token / 已过期：持有 `fetch_lock` 强制 `fetch_token`；失败 → `Err(TokenFetchFailed(...))`（→ **502**）。
 
-### `fetch_token(client: &Client, bot: &Bot) -> Result<TokenEntry, ApiError>`（模块私有）
+### `fetch_token(client: &Client, bot: &Bot, timeout: Duration) -> Result<TokenEntry, ApiError>`（模块私有）
 
-- 请求：`POST {bot.resolve_api_base()}/app/getAppAccessToken`，JSON body `{ "appId": bot.app_id, "clientSecret": bot.app_secret }`，`default_timeout_secs` 包裹。
+- 请求：`POST {bot.resolve_api_base()}/app/getAppAccessToken`，JSON body `{ "appId": bot.app_id, "clientSecret": bot.app_secret }`，调用方给的 `timeout` 包裹 `send()`（token 换发在用户请求热路径上，不能被平台挂死）。
 - 响应判定：**HTTP 恒为 200**，以响应体 `access_token` 字段存在判成功（ADR-Q3）：
   - 成功：`access_token: String` + `expires_in`（number 或数字字符串，自定义反序列化两种都收，解析失败丢弃该字段并告警；缺失时按 7200 兜底）；`expires_at = now + expires_in`。
   - 失败： body 含 `code` / `message` → `Err`，错误消息含 code 与 message（便于排障，如 `100007` appid 无效）。
@@ -198,7 +199,7 @@
 
 - 所有变更端点成功后先 `state.persist_bots()` 再返回；持久化失败 → 500。
 - `BotInput`（POST body）：`id`/`name` Option（id 省略生成），`app_id`/`app_secret` 必填，其余字段（`sandbox`/`api_base`/`ws_url`/`intents`/`shard`/`event_source`/`event_url`/`event_secret`/`enabled`) Option。
-- `BotPatch`（PUT body）：全 Option，与 `ProviderPatch` 同构的合并语义。`api_base`/`ws_url`/`event_url`/`event_secret` 为 **`Option<Option<String>>`**：字段缺省 = 保留原值；显式 `null` = 清除覆盖（用平台默认 / 不投递）；字符串 = 设新值（空串同 null，归一化在 `apply_patch` 前的 `normalize` 完成）。**`id` 不可改**（与路由 / 供应商一致）。
+- `BotPatch`（PUT body）：全 Option，与 `ProviderPatch` 同构的合并语义。`api_base`/`ws_url`/`event_url`/`event_secret` 为 **`Option<Option<String>>`**：字段缺省 = 保留原值；显式 `null` = 清除覆盖（用平台默认 / 不投递）；字符串 = 设新值（空串同 null，由 `apply_patch` 内部调 `normalize` 收敛）。**`id` 不可改**（与路由 / 供应商一致）。
 - **WS 生命周期联动**（变更端点内，持久化成功之后）：
   - POST 成功且 `enabled && event_source == Websocket` → `bot_ws.ensure(&bot, &state)`。
   - PUT 成功 → `bot_ws.stop(&bot.id)`（旧 supervisor 必须重连：配置已变），若新形态需要 WS → `ensure`。
