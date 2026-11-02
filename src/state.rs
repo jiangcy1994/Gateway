@@ -8,6 +8,7 @@ use crate::llm::provider::ProviderTable;
 use crate::llm::quota::QuotaTracker;
 use crate::metrics::RouteStats;
 use crate::qqbot::bot::BotTable;
+use crate::qqbot::token::TokenStore;
 use crate::router::RouteTable;
 
 /// Shared state behind every handler: the route table, provider table, per-route
@@ -23,6 +24,7 @@ pub struct AppState {
     pub routes: RouteTable,
     pub providers: ProviderTable,
     pub bots: BotTable,
+    pub bot_tokens: TokenStore,
     pub(crate) stats: Arc<RwLock<HashMap<String, Arc<RouteStats>>>>,
     pub(crate) health: Arc<RwLock<HashMap<String, HealthState>>>,
     pub(crate) llm_stats: Arc<RwLock<HashMap<String, Arc<RouteStats>>>>,
@@ -41,6 +43,7 @@ impl AppState {
             routes: RouteTable::default(),
             providers: ProviderTable::default(),
             bots: BotTable::default(),
+            bot_tokens: TokenStore::new(),
             stats: Arc::new(RwLock::new(HashMap::new())),
             health: Arc::new(RwLock::new(HashMap::new())),
             llm_stats: Arc::new(RwLock::new(HashMap::new())),

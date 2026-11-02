@@ -25,14 +25,16 @@ use crate::config::Settings;
 use crate::state::AppState;
 
 /// Builds the full app: `/health` and `/__admin/*` are served by this gateway,
-/// `/llm/*` by the embedded LLM sub-gateway, everything else falls through to
-/// the proxy fallback. `/llm` is a reserved prefix: routes mounted under it in
-/// `routes.toml` never win over the nest (ADR-L5).
+/// `/llm/*` by the embedded LLM sub-gateway, `/qqbot/*` by the embedded QQ Bot
+/// sub-gateway, everything else falls through to the proxy fallback. `/llm` and
+/// `/qqbot` are reserved prefixes: routes mounted under either in `routes.toml`
+/// never win over the nest (ADR-L5 / ADR-Q5).
 pub fn build_app(state: AppState) -> Router {
     Router::<AppState>::new()
         .route("/health", get(root_health))
         .nest("/__admin", admin::admin_router())
         .nest("/llm", llm::llm_router())
+        .nest("/qqbot", qqbot::qqbot_router())
         .fallback(proxy::proxy)
         .with_state(state)
 }
