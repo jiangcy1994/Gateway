@@ -49,6 +49,7 @@ fn llm_settings(routes_path: PathBuf, providers_path: PathBuf) -> Settings {
         admin_key: Some(ADMIN_KEY.to_string()),
         routes_file: routes_path,
         providers_file: providers_path,
+        bots_file: std::path::PathBuf::from("bots.toml"),
         health_interval_secs: 600,
         health_timeout_secs: 2,
         default_timeout_secs: 15,

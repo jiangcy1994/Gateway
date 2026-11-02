@@ -6,6 +6,7 @@ pub mod llm;
 pub mod logging;
 pub mod metrics;
 pub mod proxy;
+pub mod qqbot;
 pub mod router;
 pub mod state;
 
@@ -58,6 +59,7 @@ pub async fn run_with_shutdown(
     let bind = settings.bind.clone();
     let routes_path = settings.routes_file.clone();
     let providers_path = settings.providers_file.clone();
+    let bots_path = settings.bots_file.clone();
 
     let state = AppState::new(settings)?;
     let routes = config::load_routes(&routes_path)
@@ -78,6 +80,12 @@ pub async fn run_with_shutdown(
         "loaded {count} provider(s) from {}",
         providers_path.display()
     );
+
+    let bots = config::load_bots(&bots_path)
+        .map_err(|e| format!("failed to load bots from {}: {e}", bots_path.display()))?;
+    let count = bots.len();
+    state.bots.set_all(bots);
+    tracing::info!("loaded {count} bot(s) from {}", bots_path.display());
 
     health::spawn(state.clone());
 
