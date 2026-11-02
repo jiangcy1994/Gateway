@@ -156,7 +156,9 @@ class Gateway:
             }
         )
         self.proc = subprocess.Popen(
-            [GATEWAY_BIN], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            # Windows 上无参数启动会尝试进入 SCM 服务模式（虚报 1063），
+            # 必须显式带 `run` 走控制台模式（src/service.rs::dispatch）。
+            [GATEWAY_BIN, "run"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         deadline = time.time() + 15
         while time.time() < deadline:
