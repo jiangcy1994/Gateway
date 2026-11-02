@@ -3,6 +3,7 @@ name = "top-gateway"
 version = "0.1.0"
 edition = "2021"
 description = "Top-level gateway: mounts sub-gateways under path prefixes, forwards traffic, and exposes an admin REST API for routing, health, and metrics"
+license = "MIT"
 
 [dependencies]
 axum = "0.8"
