@@ -176,9 +176,9 @@
    - 其他（含 1006 等传输层码）→ 保留 session 重连。
    - 实现注意：`tungstenite::Error::Protocol(Closed(code))` 或 `Message::Close` 携带的 code 才是平台语义码；传输层错误（`Io` / `AlreadyClosed`）一律走「保留 session 重连」。
 
-### `deliver_event(state, bot, payload: Bytes)`（模块级，webhook 与 ws 共用）
+### `deliver_event(state: AppState, bot: Bot, payload: Bytes, content_type: String)`（模块级，webhook 与 ws 共用）
 
-- 与 webhook ②第 5 步的异步投递逻辑完全同一实现（event_url 为 None 计错误丢弃；Bearer event_secret；5s 超时；失败 `record_error`）。
+- 与 webhook ②第 5 步的异步投递逻辑完全同一实现（event_url 为 None 计错误丢弃；Bearer event_secret；5s 超时；失败 `record_error`）；`content_type` 由调用方传入：webhook 透传请求头里同一个值，WS 侧传 `application/json`。
 - webhook 与 ws 两处调用都先 `tokio::spawn`。
 
 ---
