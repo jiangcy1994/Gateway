@@ -7,7 +7,10 @@
 ```
 main.rs ──► lib.rs (run / build_app)
               ├─► admin.rs   ──► router.rs (Route, RouteTable, RoutePatch)
+              │                └─► llm/、qqbot/ 的 admin 端点嵌套在此 nest 内
               ├─► proxy.rs   ──► router.rs
+              ├─► llm/       ──► 内嵌 LLM 子网关（模块划分见 sdd/llm/architecture.md）
+              ├─► qqbot/     ──► 内嵌 QQ Bot 子网关（模块划分见 sdd/qqbot/architecture.md）
               ├─► health.rs  ──► router.rs, state.rs
               ├─► state.rs   ──► config.rs, router.rs, health.rs, metrics.rs
               ├─► config.rs  ──► router.rs (Route 的 TOML 序列化)
@@ -15,7 +18,7 @@ main.rs ──► lib.rs (run / build_app)
               └─► error.rs   （被除 main.rs 外所有模块引用）
 ```
 
-依赖单向往下、无环：`proxy` 与 `admin` 都只读写 `router` 的路由表，互不直接调用。`error.rs` 是叶子模块。
+依赖单向往下、无环：`proxy` 与 `admin` 都只读写 `router` 的路由表，互不直接调用。`llm/` 与 `qqbot/` 是内嵌子网关，集成点只有 `state.rs` / `config.rs` / `lib.rs`，不反向依赖顶层模块；`error.rs` 是叶子模块。
 
 ## 请求流程（代理路径）
 
@@ -26,6 +29,8 @@ HTTP 请求
 build_app 的 Router
    ├─ /health            → lib.rs::root_health → 200 {"status":"ok"}
    ├─ /__admin/*         → admin.rs（require_admin 鉴权后处理）
+   ├─ /llm/*             → 内嵌 LLM 子网关（保留前缀，不进前缀路由）
+   ├─ /qqbot/*           → 内嵌 QQ Bot 子网关（保留前缀，不进前缀路由）
    └─ 其他（fallback）   → proxy.rs::proxy
         ├─ match_route(path) 找不到          → 404
         ├─ route.enabled == false            → 503
@@ -55,7 +60,15 @@ build_app 的 Router
    ├─ DELETE /routes/{id}       → remove → persist
    ├─ GET    /health            → health_snapshot（与当前路由表 join）
    ├─ GET    /metrics           → 每路由 stats 快照
-   └─ POST   /probe             → 同步探测全部启用路由，首个不健康 → 500
+   ├─ POST   /probe             → 同步探测全部启用路由，首个不健康 → 500
+   │
+   ├─ /llm/providers[/{id}]     → 供应商 CRUD（合并式 PUT，显式 null = 不限）
+   ├─ GET    /llm/quota         → 各供应商窗口内 RPM/TPM 用量与余量
+   ├─ GET    /llm/metrics       → 各供应商 stats 快照
+   │
+   ├─ /qqbot/bots[/{id}]        → 机器人 CRUD（合并式 PUT，显式 null = 清除覆盖；联动 WS supervisor）
+   ├─ GET    /qqbot/ws          → 各 WS supervisor 连接 / session / 心跳状态
+   └─ GET    /qqbot/metrics     → 各机器人 stats 快照
 ```
 
 ## 关键架构性质
@@ -68,4 +81,4 @@ build_app 的 Router
 
 ## 部署形态
 
-单二进制（`cargo build --release` → `target/release/top-gateway`），环境变量配置，`routes.toml` 与二进制同目录（可由 `GATEWAY_ROUTES_FILE` 改）。无外部依赖。
+单二进制（`cargo build --release` → `target/release/top-gateway`），环境变量配置，`routes.toml` / `providers.toml` / `bots.toml` 与二进制同目录（可由 `GATEWAY_ROUTES_FILE` / `GATEWAY_PROVIDERS_FILE` / `GATEWAY_BOTS_FILE` 改）。无外部依赖。
