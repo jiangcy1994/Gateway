@@ -15,6 +15,7 @@ pub mod bot;
 pub mod forward;
 pub mod token;
 pub mod webhook;
+pub mod ws;
 
 use axum::routing::post;
 use axum::Router;

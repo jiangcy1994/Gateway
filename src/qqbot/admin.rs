@@ -19,6 +19,7 @@ pub fn admin_router() -> Router<AppState> {
             "/bots/{id}",
             get(get_bot).put(update_bot).delete(delete_bot),
         )
+        .route("/ws", get(get_ws))
         .route("/metrics", get(get_metrics))
 }
 
@@ -53,6 +54,8 @@ async fn create_bot(
     bot.validate().map_err(ApiError::InvalidBot)?;
     state.bots.add(bot.clone())?;
     state.persist_bots()?;
+    // WS 生命周期联动：新形态需要 WS → 起 supervisor（ADR-Q9）。
+    state.bot_ws.ensure(&bot, &state);
     tracing::info!(
         bot = %bot.id,
         app_id = %bot.app_id,
@@ -77,6 +80,11 @@ async fn update_bot(
     updated.validate().map_err(ApiError::InvalidBot)?;
     state.bots.replace(&id, updated.clone())?;
     state.persist_bots()?;
+    // 旧 supervisor 必须重连（配置已变）：停掉，需要时重建。
+    state.bot_ws.stop(&id);
+    if updated.ws_needs_connection() {
+        state.bot_ws.ensure(&updated, &state);
+    }
     tracing::info!(bot = %id, "bot updated");
     Ok(Json(updated))
 }
@@ -91,8 +99,26 @@ async fn delete_bot(
         return Err(ApiError::BotNotFound(id.clone()));
     }
     state.persist_bots()?;
+    state.bot_ws.stop(&id);
     tracing::info!(bot = %id, "bot removed");
     Ok(Json(json!({ "deleted": id })))
+}
+
+/// WS supervisor 快照，按 bot 表序 join（表内无该项的 bot 不出列）。
+async fn get_ws(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers)?;
+    let statuses = state.bot_ws.snapshot();
+    let bots = state.bots.list();
+    let mut views = Vec::with_capacity(statuses.len());
+    for bot in &bots {
+        if let Some(status) = statuses.iter().find(|s| s.bot_id == bot.id) {
+            views.push(status);
+        }
+    }
+    Ok::<_, ApiError>(Json(json!({ "bots": views })))
 }
 
 /// 按 bot 聚合的透传统计。bot id、route id、provider id 各占一张表，

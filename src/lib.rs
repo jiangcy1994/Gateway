@@ -89,6 +89,17 @@ pub async fn run_with_shutdown(
     state.bots.set_all(bots);
     tracing::info!("loaded {count} bot(s) from {}", bots_path.display());
 
+    // 启动 spawn：每个 enabled 且 websocket 形态的机器人起 WS supervisor。
+    let ws_count = state
+        .bots
+        .list()
+        .iter()
+        .filter_map(|bot| state.bot_ws.ensure(bot, &state))
+        .count();
+    if ws_count > 0 {
+        tracing::info!("spawned {ws_count} websocket supervisor(s)");
+    }
+
     health::spawn(state.clone());
 
     let app = build_app(state);
