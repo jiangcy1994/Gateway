@@ -4,4 +4,4 @@ Cargo.lock.bak
 routes.local.toml
 .env
 __pycache__/
-observation/socket/.token
+observation/**/.token

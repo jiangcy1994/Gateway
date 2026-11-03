@@ -53,3 +53,24 @@
 | `llm_admin_rejects_invalid_provider` | `Provider::validate` 后置 + `llm/admin` 端点表 | 非法 base_url → 400；JSON 缺必填字段 → 422（axum 标准行为，与路由 API 一致） |
 | `llm_metrics_view_reports_per_provider_stats` | `llm/admin` 指标端点 | 按供应商的请求数 / 并发 / 错误 / 延迟 |
 | `llm_coexists_with_route_table` | `llm/lib` 集成契约 | `/llm/*` 与 `routes.toml` 前缀路由共存互不影响 |
+
+## QQ Bot 子网关（`tests/qqbot_gateway.rs`）
+
+> 规格来源为 `../sdd/qqbot/interfaces.md`。三个 mock 平台（OpenAPI 上游 / 事件订阅者 / mock WSS）由测试自带；token 缓存的并发不变式与关闭码全表未单列测试函数，由 WS 类测试内联断言（见各条「验证要点」）。
+
+| 测试函数 | 覆盖需求（来源） | 验证要点 |
+|---|---|---|
+| `forwards_openapi_with_qqbot_token` | `forward` 后置第 1/3/5/6/9 步 + `fetch_token` 契约 | 首段 app_id 路由、token 由 `POST /app/getAppAccessToken` 换取且缓存复用、`Authorization: QQBot <token>` 注入（客户端凭证被替换）、`x-qqbot-bot` 响应头、`x-forwarded-host/path` |
+| `forward_rejects_unknown_or_disabled_bots` | `forward` 后置第 2 步 + ADR-Q8 | 未知 app_id → 404；disabled → 503（`BotDisabled`）；回调路径 disabled 统一 404 |
+| `forward_502_on_dead_upstream` | `forward` 后置第 8/11 步 | 传输错误 502 且计一次错误（本机回环 refused ~2s，故 timeout 30s） |
+| `forward_504_on_timeout` | `forward` 后置第 8 步 | 上游超时 504 且计一次错误 |
+| `webhook_validation_and_error_paths` | `webhook` 后置第 1/2/3/4 步 + `sign_validation` | `X-Bot-Appid` 与路径不一致 → 401；未知/禁用 bot → 404；非 JSON → 400；op 13 回 `plain_token` + 签名（独立 ed25519 重算镜像种子构造与拼接顺序） |
+| `webhook_acks_then_delivers_event` | `webhook` 后置第 5 步 + ADR-Q2 | 先 ACK（`{"op":12}`）后异步投递；订阅者收到原样字节、`Bearer <event_secret>` 与原 `Content-Type` |
+| `event_without_event_url_counts_error` | `webhook` 后置第 5 步（`event_url` 为 None 分支） | 无 event_url → 计一次错误并丢弃，ACK 仍 200 |
+| `admin_qqbot_endpoints_require_key` | `admin` 鉴权（沿用 `require_admin` 契约） | 无/错 key → 401；正确 `X-Admin-Key` 放行 |
+| `bot_admin_crud_and_persistence` | `admin` 端点表 + `config.rs` 持久化 + WS 生命周期联动 | CRUD 全流程、合并式 PUT（`Option<Option<String>>`：缺省保留 / 显式 `null` 清除）、`bots.toml` 原子写回、POST/PUT/DELETE 联动 supervisor ensure/stop |
+| `metrics_view_reports_forward_stats` | `admin` 指标端点 + `StatsSnapshot` 后置 | 按 **bot id** 的 total / errors / avg_latency；bot id 与 route id stats 不串号（ADR-L9 同构） |
+| `qqbot_prefix_is_reserved_from_route_table` | ADR-Q5（`lib.rs` 集成契约） | `/qqbot` 前缀路由永不生效（nest 优先于 fallback），route 与 bot 同名共存 |
+| `ws_supervisor_identifies_heartbeats_and_delivers` | supervisor 第 3/4/5 步 | Hello → Identify（`token: "QQBot <token>"` / intents / shard）→ READY 存 session → 心跳 op 1（`d` = 最新 seq，首拍 null）→ op 11 ack；op 0 事件异步投递到 event_url |
+| `ws_supervisor_stops_on_unretryable_close` | supervisor 第 6 步关闭码分流 | 4014 类不可重试码 → 停止不重连：等待后连接数不增、无 op 6 Resume 帧 |
+| `ws_supervisor_resumes_session_after_abrupt_drop` | supervisor 第 4/5 步（Resume 分支） | 断线后重连发 op 6（带 session_id + seq），收到 `RESUMED`，session 跨重连不丢失 |

@@ -6,6 +6,7 @@ pub mod llm;
 pub mod logging;
 pub mod metrics;
 pub mod proxy;
+pub mod qqbot;
 pub mod router;
 pub mod state;
 
@@ -24,14 +25,16 @@ use crate::config::Settings;
 use crate::state::AppState;
 
 /// Builds the full app: `/health` and `/__admin/*` are served by this gateway,
-/// `/llm/*` by the embedded LLM sub-gateway, everything else falls through to
-/// the proxy fallback. `/llm` is a reserved prefix: routes mounted under it in
-/// `routes.toml` never win over the nest (ADR-L5).
+/// `/llm/*` by the embedded LLM sub-gateway, `/qqbot/*` by the embedded QQ Bot
+/// sub-gateway, everything else falls through to the proxy fallback. `/llm` and
+/// `/qqbot` are reserved prefixes: routes mounted under either in `routes.toml`
+/// never win over the nest (ADR-L5 / ADR-Q5).
 pub fn build_app(state: AppState) -> Router {
     Router::<AppState>::new()
         .route("/health", get(root_health))
         .nest("/__admin", admin::admin_router())
         .nest("/llm", llm::llm_router())
+        .nest("/qqbot", qqbot::qqbot_router())
         .fallback(proxy::proxy)
         .with_state(state)
 }
@@ -58,6 +61,7 @@ pub async fn run_with_shutdown(
     let bind = settings.bind.clone();
     let routes_path = settings.routes_file.clone();
     let providers_path = settings.providers_file.clone();
+    let bots_path = settings.bots_file.clone();
 
     let state = AppState::new(settings)?;
     let routes = config::load_routes(&routes_path)
@@ -78,6 +82,23 @@ pub async fn run_with_shutdown(
         "loaded {count} provider(s) from {}",
         providers_path.display()
     );
+
+    let bots = config::load_bots(&bots_path)
+        .map_err(|e| format!("failed to load bots from {}: {e}", bots_path.display()))?;
+    let count = bots.len();
+    state.bots.set_all(bots);
+    tracing::info!("loaded {count} bot(s) from {}", bots_path.display());
+
+    // 启动 spawn：每个 enabled 且 websocket 形态的机器人起 WS supervisor。
+    let ws_count = state
+        .bots
+        .list()
+        .iter()
+        .filter_map(|bot| state.bot_ws.ensure(bot, &state))
+        .count();
+    if ws_count > 0 {
+        tracing::info!("spawned {ws_count} websocket supervisor(s)");
+    }
 
     health::spawn(state.clone());
 

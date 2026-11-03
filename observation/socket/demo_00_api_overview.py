@@ -16,7 +16,7 @@
     mock upstream（本脚本自起的 HTTP 服务）
 
 运行方式（用环境中 uv 的 Python）：
-    # token 存在上级目录 observation/.token（已 gitignore，随时可改）：
+    # token 存在 llm/.token（已 gitignore，随时可改）：
     uv run python observation/socket/demo_00_api_overview.py
     # 也可用参数或环境变量覆盖：
     uv run python observation/socket/demo_00_api_overview.py sm_xxxxxxxx
@@ -58,9 +58,11 @@ ROUTE_PREFIX = "/demo"
 ROUTE_ID = "demo"
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+# .token 已随 LLM 演示移到 observation/socket/llm/，根目录演示仍要能找到它
 _TOKEN_CANDIDATES = [
     os.path.join(_HERE, ".token"),
-    os.path.join(os.path.dirname(_HERE), ".token"),  # docs/reference/.token
+    os.path.join(_HERE, "llm", ".token"),
+    os.path.join(os.path.dirname(_HERE), ".token"),
 ]
 REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 GATEWAY_BIN = os.path.join(REPO_ROOT, "target", "debug", "top-gateway.exe")
@@ -72,7 +74,7 @@ RESET = "--reset" in sys.argv
 
 # ---------------------------------------------------------------- token
 def load_token() -> str:
-    """优先级：命令行参数 > 环境变量 > .token 文件（本目录或上级 docs/reference/）。"""
+    """优先级：命令行参数 > 环境变量 > .token 文件（本目录或 llm/ 下）。"""
     if len(sys.argv) > 1 and not sys.argv[1].startswith("--"):
         return sys.argv[1].strip()
     env = os.environ.get("SOCKETMEASURE_TOKEN")
@@ -91,7 +93,7 @@ TOKEN = load_token()
 if not TOKEN:
     print(
         "未找到 SocketMeasure token。任选其一：\n"
-        "  1) 写入 observation/.token（已 gitignore）\n"
+        "  1) 写入 observation/socket/llm/.token（已 gitignore）\n"
         "  2) uv run python observation/socket/demo_00_api_overview.py <token>\n"
         "  3) 设置环境变量 SOCKETMEASURE_TOKEN",
         file=sys.stderr,
@@ -250,7 +252,9 @@ def start_gateway() -> subprocess.Popen:
         }
     )
     proc = subprocess.Popen(
-        [GATEWAY_BIN], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        # Windows 上无参数启动会尝试进入 SCM 服务模式（虚报 1063），
+        # 必须显式带 `run` 走控制台模式（src/service.rs::dispatch）。
+        [GATEWAY_BIN, "run"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     deadline = time.time() + 15
     while time.time() < deadline:

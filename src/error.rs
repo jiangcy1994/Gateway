@@ -41,6 +41,24 @@ pub enum ApiError {
     #[error("quota exhausted for protocol '{0}': all providers are at their rpm or tpm limit")]
     QuotaExhausted(String),
 
+    #[error("bot not found: {0}")]
+    BotNotFound(String),
+
+    #[error("invalid bot: {0}")]
+    InvalidBot(String),
+
+    #[error("bot id already exists: {0}")]
+    DuplicateBotId(String),
+
+    #[error("bot app_id already exists: {0}")]
+    DuplicateBotAppId(String),
+
+    #[error("bot {0} is disabled")]
+    BotDisabled(String),
+
+    #[error("failed to fetch access token: {0}")]
+    TokenFetchFailed(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -62,6 +80,12 @@ impl ApiError {
             }
             ApiError::NoProviderForProtocol(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::QuotaExhausted(_) => StatusCode::TOO_MANY_REQUESTS,
+            ApiError::BotNotFound(_) => StatusCode::NOT_FOUND,
+            ApiError::InvalidBot(_)
+            | ApiError::DuplicateBotId(_)
+            | ApiError::DuplicateBotAppId(_) => StatusCode::BAD_REQUEST,
+            ApiError::BotDisabled(_) => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::TokenFetchFailed(_) => StatusCode::BAD_GATEWAY,
         }
     }
 }

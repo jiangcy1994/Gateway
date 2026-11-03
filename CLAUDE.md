@@ -22,11 +22,12 @@ generous `timeout_secs` to avoid racing into a 504.
 manages them through an admin API. Request flow (`src/proxy.rs`):
 
 1. `/health` and `/__admin/*` are real routes; `/llm/*` is served by the embedded
-   LLM gateway (`src/llm/`); everything else hits the fallback. `/llm` is a
-   **reserved prefix** — it never reaches the route table, so do not mount a
+   LLM gateway (`src/llm/`); `/qqbot/*` by the embedded QQ Bot gateway
+   (`src/qqbot/`); everything else hits the fallback. `/llm` and `/qqbot` are
+   **reserved prefixes** — they never reach the route table, so do not mount a
    route there.
-2. `RouteTable::match_route` picks the **longest matching prefix** (`/qqbot` matches
-   `/qqbot` and `/qqbot/...`; a route at `/` matches everything).
+2. `RouteTable::match_route` picks the **longest matching prefix** (`/echo` matches
+   `/echo` and `/echo/...`; a route at `/` matches everything).
 3. If `strip_prefix`, the matched prefix is stripped and the remainder is forwarded
    to `upstream` with query string intact.
 4. Request and response **bodies stream** (`Body::from_stream` / `wrap_stream`) —
@@ -45,11 +46,11 @@ Admin API (`src/admin.rs`): `Router` under `/__admin`. The prefix is deliberatel
 `qqbot-api-gateway`).
 
 Persistence (`src/config.rs`): every admin mutation calls `AppState::persist`
-(route changes) or `persist_providers` (provider changes), which serializes the
-whole table to TOML and replaces the file atomically
+(route changes), `persist_providers` (provider changes) or `persist_bots` (bot
+changes), which serializes the whole table to TOML and replaces the file atomically
 (temp file in the same directory + `persist`). **Rewrites drop comments** — the
-managed header line is the only comment that survives. A missing routes or
-providers file at startup is not fatal: the gateway starts with none.
+managed header line is the only comment that survives. A missing routes,
+providers or bots file at startup is not fatal: the gateway starts with none.
 
 Health (`src/health.rs`): background task probes `upstream + health_path` every
 `GATEWAY_HEALTH_INTERVAL_SECS`; the first sweep runs immediately after boot rather
@@ -83,18 +84,48 @@ consumer drop; extraction is best-effort and never fails (missing usage records
 forwarding work, accounting does not. `docs/sdd/llm/interfaces.md` is the
 implementation authority for this module.
 
+QQ Bot gateway (`src/qqbot/`): three channels over one bot table. OpenAPI
+passthrough at `/qqbot/{app_id}/...` — the first path segment is the platform
+`app_id` (the routing key), the rest joins `api_base`; the gateway fetches and
+caches `access_token` (`POST /app/getAppAccessToken`, success judged by
+`access_token` present in the body because the platform always returns HTTP 200 —
+ADR-Q3; cached until 5 min before expiry with a 30 s refresh cooldown, and a
+refresh returning the same token string does **not** rewrite `expires_at`
+—ADR-Q6), then injects `Authorization: QQBot <token>` (client credentials always
+replaced) and `x-qqbot-bot: <bot id>` on the response. Webhook callbacks at
+`/qqbot/callback/{app_id}`: `op == 13` gets an ed25519 signature reply (sign-only
+— the platform's inbound-signature public key is not in the reference docs,
+ADR-Q7/R4); every other op is ACK'd with `{"op":12}` **before** the async
+delivery to `bot.event_url` (at-most-once, failure counts an error and is never
+retried or surfaced to the platform — ADR-Q13). Bots with
+`event_source = "websocket"` get a background WS supervisor per bot
+(`WsTable`): Identify → READY (stores `session_id`) → periodic heartbeat
+(op 1 with the latest seq, first beat null; 2 missed op 11 acks → reconnect) →
+events delivered to `event_url` by the same `deliver_event` the webhook uses;
+disconnects are dispatched by close code (4008/4009 resume-retry,
+4006/4007/4900..=4913 re-identify clearing the session,
+4001/4002/4010..=4014/4914/4915 stop without reconnecting, everything else
+including 1006 keeps the session), exponential backoff 2 s → 60 s. Disabled bots
+return 503 on forwarding but **404** on the callback path (ADR-Q8).
+`docs/sdd/qqbot/interfaces.md` is the implementation authority for this module.
+
 ## Conventions
 
 - Error responses are JSON: `{"error":{"code":502,"message":"..."}}` via `ApiError`
   (`src/error.rs`), which maps each variant to a status code.
 - The TOML routes file and the admin API share one `Route` struct; anything
   settable in the file is settable through the API and vice versa. Same for
-  `Provider` / `providers.toml` / `/__admin/llm/providers`.
+  `Provider` / `providers.toml` / `/__admin/llm/providers` and `Bot` /
+  `bots.toml` / `/__admin/qqbot/bots`.
 - `PUT /__admin/routes/{id}` is **merge** semantics: absent fields keep the
   current value. `id` is never patchable. Same for `PUT /__admin/llm/providers/{id}`,
   where `rpm_limit`/`tpm_limit` are `Option<Option<u64>>` — absent keeps the value,
   explicit `null` sets unlimited (the `deserialize_some` recipe in
-  `src/llm/provider.rs` is what separates them; serde's default does not).
+  `src/llm/provider.rs` is what separates them; serde's default does not). Same
+  for `PUT /__admin/qqbot/bots/{id}`, where `api_base`/`ws_url`/`event_url`/
+  `event_secret` are `Option<Option<String>>` — absent keeps the value, explicit
+  `null` clears the override. Bot mutations also drive the WS supervisor lifecycle
+  (`bot_ws.ensure` / `stop`) after persisting.
 - Missing required fields in a JSON body return **422** (axum `Json` extractor
-  rejection, same for routes and providers); 400 is reserved for `validate()`
+  rejection, same for routes, providers and bots); 400 is reserved for `validate()`
   rule failures and duplicate ids.

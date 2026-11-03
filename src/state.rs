@@ -7,6 +7,9 @@ use crate::health::HealthState;
 use crate::llm::provider::ProviderTable;
 use crate::llm::quota::QuotaTracker;
 use crate::metrics::RouteStats;
+use crate::qqbot::bot::BotTable;
+use crate::qqbot::token::TokenStore;
+use crate::qqbot::ws::WsTable;
 use crate::router::RouteTable;
 
 /// Shared state behind every handler: the route table, provider table, per-route
@@ -21,10 +24,14 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub routes: RouteTable,
     pub providers: ProviderTable,
+    pub bots: BotTable,
+    pub bot_tokens: TokenStore,
+    pub bot_ws: WsTable,
     pub(crate) stats: Arc<RwLock<HashMap<String, Arc<RouteStats>>>>,
     pub(crate) health: Arc<RwLock<HashMap<String, HealthState>>>,
     pub(crate) llm_stats: Arc<RwLock<HashMap<String, Arc<RouteStats>>>>,
     pub(crate) llm_quotas: Arc<RwLock<HashMap<String, Arc<QuotaTracker>>>>,
+    pub(crate) bot_stats: Arc<RwLock<HashMap<String, Arc<RouteStats>>>>,
 }
 
 impl AppState {
@@ -37,10 +44,14 @@ impl AppState {
             client,
             routes: RouteTable::default(),
             providers: ProviderTable::default(),
+            bots: BotTable::default(),
+            bot_tokens: TokenStore::new(),
+            bot_ws: WsTable::new(),
             stats: Arc::new(RwLock::new(HashMap::new())),
             health: Arc::new(RwLock::new(HashMap::new())),
             llm_stats: Arc::new(RwLock::new(HashMap::new())),
             llm_quotas: Arc::new(RwLock::new(HashMap::new())),
+            bot_stats: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -64,6 +75,19 @@ impl AppState {
             return stats.clone();
         }
         let mut stats = self.llm_stats.write().unwrap();
+        stats
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(RouteStats::default()))
+            .clone()
+    }
+
+    /// Stats for a QQ bot. Kept in a map separate from routes and providers so
+    /// route ids, provider ids and bot ids cannot collide（ADR-L9 同构）。
+    pub fn bot_stats_for(&self, id: &str) -> Arc<RouteStats> {
+        if let Some(stats) = self.bot_stats.read().unwrap().get(id) {
+            return stats.clone();
+        }
+        let mut stats = self.bot_stats.write().unwrap();
         stats
             .entry(id.to_string())
             .or_insert_with(|| Arc::new(RouteStats::default()))
@@ -94,5 +118,10 @@ impl AppState {
     /// Same contract as `persist`, for the providers table（ADR-L10：独立文件）。
     pub fn persist_providers(&self) -> Result<(), ApiError> {
         config::save_providers(&self.settings.providers_file, &self.providers.list())
+    }
+
+    /// Same contract as `persist`, for the bots table（ADR-Q1：独立配置面）。
+    pub fn persist_bots(&self) -> Result<(), ApiError> {
+        config::save_bots(&self.settings.bots_file, &self.bots.list())
     }
 }

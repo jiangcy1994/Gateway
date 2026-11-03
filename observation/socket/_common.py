@@ -23,10 +23,13 @@ DEFAULT_LISTEN_PORT = 19190           # 面板监听器起始端口，冲突自�
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 GATEWAY_BIN = os.path.join(_REPO_ROOT, "target", "debug", "top-gateway.exe")
 
-# token 查找顺序：脚本所在目录 .token -> 上级 docs/reference/.token
+# token 查找顺序：脚本所在目录 .token -> llm 子目录 .token -> 上级 observation/.token
+# （.token 已随 LLM 演示移到 observation/socket/llm/，根目录演示仍要能找到它）
+_HERE = os.path.dirname(os.path.abspath(__file__))
 _TOKEN_CANDIDATES = [
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".token"),
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".token"),
+    os.path.join(_HERE, ".token"),
+    os.path.join(_HERE, "llm", ".token"),
+    os.path.join(os.path.dirname(_HERE), ".token"),
 ]
 
 
@@ -156,7 +159,9 @@ class Gateway:
             }
         )
         self.proc = subprocess.Popen(
-            [GATEWAY_BIN], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            # Windows 上无参数启动会尝试进入 SCM 服务模式（虚报 1063），
+            # 必须显式带 `run` 走控制台模式（src/service.rs::dispatch）。
+            [GATEWAY_BIN, "run"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         deadline = time.time() + 15
         while time.time() < deadline:

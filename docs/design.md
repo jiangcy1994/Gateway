@@ -17,6 +17,8 @@
 
 顺序即依赖：2 依赖 1，3 依赖 2，4 依赖 3……允许回跳，不允许跳步。
 
+子系统按同一六步开**子套件**：LLM 子网关的 [sdd/llm/](sdd/llm/interfaces.md) 与 QQ Bot 子网关的 [sdd/qqbot/](sdd/qqbot/interfaces.md)，其 `interfaces.md` 各自是该子系统的实现权威；ADR 编号独立成段（`ADR-L*` / `ADR-Q*`），不与根 ADR 混编。根 `sdd/interfaces.md` 只描述顶层网关本身，不重复子系统契约。
+
 ## TDD 过程记录
 
 | 文档 | 回答 |
@@ -37,13 +39,17 @@
 | `src/metrics.rs` | 每路由无锁计数器与 `InFlightGuard` |
 | `src/state.rs` | `AppState`：共享状态的廉价 Clone 句柄 |
 | `src/error.rs` | `ApiError` 枚举到 HTTP 状态码与 JSON 错误体的映射 |
+| `src/llm/` | 内嵌 LLM 子网关：按协议段选供应商池、配额加权选择、usage 事后计量（规格见 `sdd/llm/`） |
+| `src/qqbot/` | 内嵌 QQ Bot 子网关：OpenAPI 透传（token 自动换发）、webhook 回调接收、WS 网关客户端（规格见 `sdd/qqbot/`） |
+| `src/service.rs` | Windows 服务外壳（SCM 状态上报与 install/start/stop/uninstall 管理命令，仅 Windows 目标） |
 
 ## 接口速览
 
-- 对外 HTTP：`GET /health`（无需鉴权）、`/__admin/*`（需 `X-Admin-Key`）、其余路径全部走代理。
-- 管理 API：`GET/POST /__admin/routes`、`GET/PUT/DELETE /__admin/routes/{id}`、`GET /__admin/health`、`GET /__admin/metrics`、`POST /__admin/probe`。
+- 对外 HTTP：`GET /health`（无需鉴权）、`/__admin/*`（需 `X-Admin-Key`）、`/llm/*`（内嵌 LLM 子网关）、`/qqbot/*`（内嵌 QQ Bot 子网关），其余路径全部走代理。
+- **保留前缀**：`/llm` 与 `/qqbot` 由内嵌子网关处理，永远不会落到前缀路由；不要在 `routes.toml` 里挂这两个前缀。
+- 管理 API：`GET/POST /__admin/routes`、`GET/PUT/DELETE /__admin/routes/{id}`、`GET /__admin/health`、`GET /__admin/metrics`、`POST /__admin/probe`；`GET/POST /__admin/llm/providers`、`GET/PUT/DELETE /__admin/llm/providers/{id}`、`GET /__admin/llm/quota`、`GET /__admin/llm/metrics`；`GET/POST /__admin/qqbot/bots`、`GET/PUT/DELETE /__admin/qqbot/bots/{id}`、`GET /__admin/qqbot/ws`、`GET /__admin/qqbot/metrics`。
 - Rust 公共 API：`build_app(state) -> Router`、`run(settings)`、`AppState::new(settings)`、`RouteTable::{set_all, list, get, match_route, add, replace, remove}`。
-- 完整签名与前后置条件见 [sdd/interfaces.md](sdd/interfaces.md)。
+- 完整签名与前后置条件见 [sdd/interfaces.md](sdd/interfaces.md)；子系统契约见各自子套件的 `interfaces.md`。
 
 ## 维护声明
 

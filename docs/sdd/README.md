@@ -32,9 +32,9 @@ overview → architecture → data-model → interfaces → decisions → risks
 
 ## 子系统子套件
 
-新增子系统按同一六步开**子套件**（如 LLM 子网关的 `llm/`），`interfaces.md`
-同样是该子系统的实现权威；根 `interfaces.md` 只描述顶层网关本身，不重复子系统
-契约。子系统套件的 ADR 编号独立成段（如 `ADR-L*`），不与根 ADR 混编。
+新增子系统按同一六步开**子套件**（如 LLM 子网关的 `llm/`、QQ Bot 子网关的 `qqbot/`），
+`interfaces.md` 同样是该子系统的实现权威；根 `interfaces.md` 只描述顶层网关本身，
+不重复子系统契约。子系统套件的 ADR 编号独立成段（如 `ADR-L*` / `ADR-Q*`），不与根 ADR 混编。
 
 ## 与其他目录的分工
 

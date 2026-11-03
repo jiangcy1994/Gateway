@@ -5,9 +5,9 @@ Rust 实现（axum + tokio + reqwest），与 `qqbot-api-gateway` 同一技术�
 
 ```
 client ──► top-gateway:8000
-              ├─ /qqbot/*        ──► 127.0.0.1:8080  (qqbot-api-gateway)
-              ├─ /qqbot-admin/*  ──► 127.0.0.1:8081  (管理后台)
+              ├─ /qqbot/*        ──► 内嵌 QQ Bot 网关（OpenAPI 透传 / webhook 回调 / WS 客户端）
               ├─ /llm/*          ──► 内嵌 LLM 网关（按协议选供应商，见下文）
+              ├─ /svc/*          ──► 127.0.0.1:9000  （routes.toml 里挂载的子网关）
               └─ /__admin/*      ──► 本网关管理 API（不转发）
 ```
 
@@ -25,6 +25,7 @@ cargo fmt && cargo clippy --all-targets
 | `GATEWAY_ADMIN_KEY` | 未设置 | `/__admin/*` 的密钥；未设置时告警且放行 |
 | `GATEWAY_ROUTES_FILE` | `routes.toml` | 路由配置文件 |
 | `GATEWAY_PROVIDERS_FILE` | `providers.toml` | LLM 供应商配置文件 |
+| `GATEWAY_BOTS_FILE` | `bots.toml` | QQ 机器人配置文件 |
 | `GATEWAY_HEALTH_INTERVAL_SECS` | `10` | 健康检查轮询间隔 |
 | `GATEWAY_HEALTH_TIMEOUT_SECS` | `2` | 单次健康探测超时 |
 | `GATEWAY_DEFAULT_TIMEOUT_SECS` | `30` | 路由未指定时的上游超时 |
@@ -34,12 +35,12 @@ cargo fmt && cargo clippy --all-targets
 
 ```toml
 [[routes]]
-id = "qqbot"
-prefix = "/qqbot"
-upstream = "http://127.0.0.1:8080"
-strip_prefix = true            # /qqbot/x -> /x
+id = "svc"
+prefix = "/svc"
+upstream = "http://127.0.0.1:9000"
+strip_prefix = true            # /svc/x -> /x
 enabled = true
-description = "QQ Bot API gateway"
+description = "an external sub-gateway mounted by prefix"
 
 [routes.headers]               # 注入到每个转发请求，覆盖客户端同名头
 x-gateway-key = "..."
@@ -80,8 +81,8 @@ curl -X PUT http://127.0.0.1:8000/__admin/routes/svc \
 
 - **最长前缀匹配**：`/echo/special` 同时匹配 `/echo` 与 `/echo/special` 时取后者。
   未匹配任何前缀返回 `404`，路由被禁用返回 `503`，上游不可达 `502`，超时 `504`。
-- **`/llm` 为保留前缀**：`/llm/*` 由内嵌 LLM 网关处理（见下文），永远不会落
-  到前缀路由；不要在 `routes.toml` 里挂 `/llm` 前缀。
+- **`/llm` 与 `/qqbot` 为保留前缀**：这两个前缀由内嵌子网关处理（见下文），永远不会
+  落到前缀路由；不要在 `routes.toml` 里挂 `/llm` 或 `/qqbot` 前缀。
 - **流式转发**：请求/响应 body 逐块透传，不缓存，可代理大文件/流式接口。
 - **请求头**：剥离 hop-by-hop 头与 `Content-Length`，其余原样透传（含
   `Authorization`，由子网关自行鉴权）；附加 `x-forwarded-host` / `x-forwarded-path`；
@@ -133,10 +134,65 @@ LLM 管理端点（同样需要 `X-Admin-Key`）：
 供应商 → `503`。TPM 由响应尾包里的 `usage` 字段事后计量（非流式取 JSON，
 流式取末尾 `data:` 块），解析不到时记 0，永不失败。
 
+## QQ Bot 网关（`/qqbot/*`）
+
+内嵌子网关，三路接入同一机器人配置：
+
+1. **OpenAPI 透传**（`/qqbot/{app_id}/...`）：路径首段是平台 `app_id`，其余部分
+   拼到 `api_base`。网关自动换发 `access_token`（`POST /app/getAppAccessToken`），
+   缓存到过期前 5 分钟、临近过期冷却 30s 防惊群，注入
+   `Authorization: QQBot <token>`——客户端凭证一律被替换。响应头附
+   `x-qqbot-bot: <bot id>` 指明命中配置。
+2. **Webhook 回调**（`/qqbot/callback/{app_id}`，POST）：平台推 `op == 13`
+   回调地址验证时，按 `app_secret` 做 ed25519 签名回 `{"plain_token","signature"}`
+   （只签不验：入站事件签名的平台公钥不在本地参考文档内）；其他事件**先 ACK**
+   `{"op":12}` 再异步转发到 `event_url`（带 `Authorization: Bearer <event_secret>`，
+   5s 超时，失败只计错误不重试、不向平台暴露）。
+3. **WebSocket 网关客户端**：`event_source = "websocket"` 的机器人启动后台
+   supervisor——Identify → READY → 周期心跳（op 1/11）→ 事件投递到 `event_url`；
+   断线按平台关闭码分流（4008/4009 可 Resume 重连、4900 段重新 Identify、
+   4010 段停止不重连、其余保留 session 重连），指数退避 2s→60s。`GET /__admin/qqbot/ws`
+   可看每个连接的 session/心跳/重连状态。
+
+```bash
+# 客户端照常调用平台 OpenAPI（app_id 由网关路由到对应凭证）
+curl http://127.0.0.1:8000/qqbot/1020304050/users/@me
+```
+
+机器人在 `bots.toml` 配置（也可全程走管理 API）：
+
+```toml
+[[bots]]
+id = "my-bot"                     # 配置 id（省略时生成 UUID）
+name = "我的机器人"
+app_id = "102030405"              # 平台 appId（路由键，全表唯一）
+app_secret = "DG5g3B4j9X2KOErG"   # 平台 clientSecret，明文落盘（同 api_key 策略）
+sandbox = false                   # true → 沙箱环境 api/ws 地址
+intents = 100663296               # 缺省 (1<<25)|(1<<26)
+# event_source = "websocket"      # webhook（缺省）| websocket
+# event_url = "http://127.0.0.1:9000/events"   # 事件投递地址
+# event_secret = "..."                         # 投递时附 Bearer
+# enabled = true
+```
+
+QQ Bot 管理端点（同样需要 `X-Admin-Key`）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/__admin/qqbot/bots` | 列出全部机器人 |
+| POST | `/__admin/qqbot/bots` | 新增机器人；`id` 省略时生成 UUID |
+| GET/PUT/DELETE | `/__admin/qqbot/bots/{id}` | 查看 / 合并式更新 / 删除（PUT 显式 `null` = 清除该覆盖） |
+| GET | `/__admin/qqbot/ws` | 各 WS supervisor 的连接 / session / 心跳状态 |
+| GET | `/__admin/qqbot/metrics` | 各机器人的请求数 / 并发 / 错误数 / 平均延迟 |
+
+错误语义：未知 `app_id` → `404`；机器人被禁用 → 转发 `503`、回调统一 `404`
+（回调地址不应再可达）；换 token 失败 / 上游不可达 → `502`；上游超时 → `504`。
+
 ## 持久化
 
-每次经管理 API 的路由变更都会原子写回 `GATEWAY_ROUTES_FILE`（临时文件 +
-rename），重启不丢失；注意重写会丢弃文件里的注释。
+每次经管理 API 的路由 / 供应商 / 机器人变更都会原子写回对应文件
+（`routes.toml` / `providers.toml` / `bots.toml`，临时文件 + rename），
+重启不丢失；注意重写会丢弃文件里的注释。
 
 ## 部署为 Windows 服务
 
@@ -161,6 +217,7 @@ rename），重启不丢失；注意重写会丢弃文件里的注释。
 %ProgramData%\top-gateway\
   ├─ routes.toml       # install 时从 exe 同目录补种缺失文件，之后由管理 API 维护
   ├─ providers.toml
+  ├─ bots.toml
   ├─ gateway.env       # KEY=VALUE，服务进程的唯一环境来源（install 时生成模板）
   └─ top-gateway.log.YYYY-MM-DD   # 按日滚动（当前文件即带日期后缀）
 ```
@@ -175,14 +232,15 @@ GATEWAY_BIND=0.0.0.0:8000
 
 注意事项：
 
-- 相对路径的 `GATEWAY_ROUTES_FILE` / `GATEWAY_PROVIDERS_FILE` 在服务模式下
-  解析到服务基目录；控制台模式仍按 cwd 解析，行为不变。`GATEWAY_BASE_DIR`
-  可覆盖基目录位置。
+- 相对路径的 `GATEWAY_ROUTES_FILE` / `GATEWAY_PROVIDERS_FILE` / `GATEWAY_BOTS_FILE`
+  在服务模式下解析到服务基目录；控制台模式仍按 cwd 解析，行为不变。
+  `GATEWAY_BASE_DIR` 可覆盖基目录位置。
 - 直接双击服务模式的 exe（无参数、未连上 SCM）会报 1063 错误并提示用
   `run` / `install`。
 - 服务只接受 `SERVICE_CONTROL_STOP`，不接受系统关机通知——在关机时限内排空
   代理请求只会拖延关机（ADR-013）。
 - `gateway.env` 里的 `GATEWAY_ADMIN_KEY` 是明文，和 `providers.toml` 里的
-  `api_key` 一样（ADR-012 / ADR-L11）：依靠 %ProgramData% 的默认 ACL 限制
-  访问，不要把密钥写进交给版本管理的模板。
+  `api_key`、`bots.toml` 里的 `app_secret` 一样（ADR-012 / ADR-L11 / ADR-Q11）：
+  依靠 %ProgramData% 的默认 ACL 限制访问，不要把密钥写进交给版本管理的模板。
+  另注意 `/qqbot/*` 本身不做客户端鉴权（`/llm/*` 同理）——部署侧绑定回环或前置反代。
 

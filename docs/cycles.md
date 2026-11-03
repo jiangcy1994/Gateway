@@ -138,3 +138,44 @@ top-gateway 的功能按 `sdd/architecture.md` 的依赖底向上实现：`route
 - 红：`llm_systemone_stub_forwards_without_token_counting`、`llm_query_string_is_preserved` —— 两条绿灯钉子：前者钉住「SystemOne 全程可路由可转发，仅 usage 记账恒为 0」；后者钉住查询串拼接。均直接通过。
 - 绿：无新实现（桩与查询串在 C16-C19 的实现中已就位）。
 - 重构：无。
+
+---
+
+## QQ Bot 子网关（`src/qqbot/`，`tests/qqbot_gateway.rs`）
+
+按 `sdd/qqbot/interfaces.md`（实现权威）实现：`bot`（配置表示）→ `token`（访问令牌缓存）→ `forward`（OpenAPI 透传）→ `webhook`（回调接收）→ `ws`（网关客户端）→ `admin`/`config`/`state`/`lib`（装配）。外部事实来源是 `docs/reference/qq_bot_api`（平台 OpenAPI、回调地址验证、WS 协议）。
+
+> 与 C1-C23 的流程差异（如实记录）：本子系统**规格先行**——SDD 六步子套件全部写完才动手写代码，实现按 phase 2-5 推进（每 phase 一个提交），**测试在 phase 6 集中补齐**。因此红灯形态不是「每功能一条运行期 FAIL」，而是「整套契约一次性用 14 条测试校验」：一次编译期红（C24）+ 两条运行期红（C28），其余为绿灯钉子（固化已决定行为，与 C15/C23 同性质——绿灯也是信息）。
+
+### C24 编译期红灯：14 条测试一次性产出 12 条编译错误（→ 全模块）
+- 红[红]：12 条编译错误，集中在三族：
+  - `E0599` ×7 —— mock WSS 的 `WebSocketStream` 上找不到 `send` / `next`：tungstenite 0.29 的这两个方法分别来自 `SinkExt` / `StreamExt`，测试未引入（实现侧 `src/qqbot/ws.rs` 引过，测试侧漏了）。
+  - `E0600` —— `assert!(soon(move || ...))` 缺 `.await`，rustc 把它报成「不能对 `impl Future` 应用一元 `!`」（宏展开造成的迷惑诊断）。
+  - `E0716` ×3 —— `frame_jsons(&shared).iter().find(...)` 直接遍历临时 Vec，借用在分号处结束。
+- 绿：引入 `use futures_util::{SinkExt, StreamExt};`；`soon(...).await`；先 `let frames = frame_jsons(&shared);` 再遍历。
+- 重构：`cargo clippy --all-targets` 顺带挖出两个**真**问题——mock echo 未回显 `x-forwarded-host`（dead_code，且会让 C25 的透传断言隐性比对 `Value::Null`，属于「测试自身的断言失效」）；`posts.lock().unwrap().len() >= 1`（len_zero，改 `!is_empty()`）。
+
+### C25 钉子：OpenAPI 透传与错误路径（→ `forward` 后置第 1/2/3/8/9 步）
+- 红：`forwards_openapi_with_qqbot_token`、`forward_rejects_unknown_or_disabled_bots`、`forward_502_on_dead_upstream`、`forward_504_on_timeout` —— 实现先于测试（phase 3），补齐 C24 的编译错误与 echo 回显后全部直接通过。
+- 绿：无新实现。
+- 重构：无。四条测试钉住：app_id 段路由 + `Authorization: QQBot <token>` 替换客户端凭证 + `x-qqbot-bot` 响应头；404（未知）/ 503（禁用，ADR-Q8 的转发侧）；502 / 504 均计错误数。502 用 `timeout_secs=30`（本机回环 refused ~2s，见 C7）。
+
+### C26 钉子：Webhook 签名镜像与先 ACK 后投递（→ `webhook` 后置 + `sign_validation`）
+- 红：`webhook_validation_and_error_paths`、`webhook_acks_then_delivers_event`、`event_without_event_url_counts_error` —— 同上，直接通过。
+- 绿：无新实现。
+- 重构：无。op 13 的签名由测试**独立重算**（种子循环补齐 32 字节、`event_ts + plain_token` 拼接、hex 小写）镜像实现，任一侧改算法即红；先 ACK（`{"op":12}`）后异步投递、无 `event_url` 计错误丢弃（ADR-Q2 / ADR-Q1）。
+
+### C27 钉子：管理端点、持久化与保留前缀（→ `admin` 端点表 + `config.rs` + ADR-Q5）
+- 红：`admin_qqbot_endpoints_require_key`、`bot_admin_crud_and_persistence`、`metrics_view_reports_forward_stats`、`qqbot_prefix_is_reserved_from_route_table` —— 同上，直接通过。
+- 绿：无新实现。
+- 重构：无。钉住：沿用 `require_admin`；`BotPatch` 的 `Option<Option<String>>` 合并语义（缺省保留 / 显式 `null` 清除）；`bots.toml` 原子写回；stats 按 bot id 与 route id 分表；`/qqbot` nest 优先于路由表 fallback。
+
+### C28 WS supervisor：心跳断言读了过期快照（→ supervisor 第 3/4/5 步）
+- 红[红]：`ws_supervisor_identifies_heartbeats_and_delivers` —— `assert!(!beats.is_empty())` 失败：`beats` 过滤的是**为 Identify 断言拍的旧 `frames` 快照**（心跳一拍都还没发出），而 `soon(...)` 轮询本身成功了（闭包内每次重读）。典型的「快照在轮询前固定、断言在轮询后用旧值」。
+- 绿：轮询后重新 `let all_frames = frame_jsons(&wss_shared);` 再过滤 op 1；Identify 断言改用早先的独立绑定。
+- 重构：由此沉淀本测试文件的固定写法——**凡 `soon` 轮询后的帧断言，一律重取快照**；且心跳只断 `d >= 1`（op 0 事件与 READY 的到达顺序与 timing 不固定，断 `d == 2` 会竞态）。
+
+### C29 钉子：关闭码分流与 Resume（→ supervisor 第 4/6 步）
+- 红：`ws_supervisor_stops_on_unretryable_close`、`ws_supervisor_resumes_session_after_abrupt_drop` —— 直接通过。
+- 绿：无新实现。
+- 重构：无。前者刻意避开「空调轮询」陷阱：先等帧出现、再轮询表项消失、**再 sleep 3s 断言连接数不增且无 op 6**——若实现暗中重连，轮询过了也会在最后一关失败。后者钉住断线后 op 6 Resume 携带原 session_id + seq 并收到 `RESUMED`。

@@ -25,7 +25,8 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# _common.py 在 socket 根目录（observation/socket/_common.py），取上级目录。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import _common as C
 
 # mock 收到的凭证（证明客户端凭证被网关替换为供应商凭证）

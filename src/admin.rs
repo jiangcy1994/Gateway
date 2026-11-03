@@ -56,6 +56,7 @@ pub fn admin_router() -> Router<AppState> {
         .route("/metrics", get(get_metrics))
         .route("/probe", post(trigger_probe))
         .nest("/llm", crate::llm::admin::admin_router())
+        .nest("/qqbot", crate::qqbot::admin::admin_router())
 }
 
 pub(crate) fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
