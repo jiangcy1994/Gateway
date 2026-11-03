@@ -23,10 +23,13 @@ DEFAULT_LISTEN_PORT = 19190           # 面板监听器起始端口，冲突自�
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 GATEWAY_BIN = os.path.join(_REPO_ROOT, "target", "debug", "top-gateway.exe")
 
-# token 查找顺序：脚本所在目录 .token -> 上级 docs/reference/.token
+# token 查找顺序：脚本所在目录 .token -> llm 子目录 .token -> 上级 observation/.token
+# （.token 已随 LLM 演示移到 observation/socket/llm/，根目录演示仍要能找到它）
+_HERE = os.path.dirname(os.path.abspath(__file__))
 _TOKEN_CANDIDATES = [
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".token"),
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".token"),
+    os.path.join(_HERE, ".token"),
+    os.path.join(_HERE, "llm", ".token"),
+    os.path.join(os.path.dirname(_HERE), ".token"),
 ]
 
 

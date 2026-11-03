@@ -1,6 +1,6 @@
 # QQ Bot Observatory —— 对着 QQ Bot Mock 的三路通道观察
 
-这个目录用 [QQ Bot Mock](../../docs/reference/qq-bot-mock-api.md)（`http://127.0.0.1:8080`）
+这个目录用 [QQ Bot Mock](../../../docs/reference/qq-bot-mock-api.md)（`http://127.0.0.1:8080`）
 作为平台替身，**观察本仓库 `top-gateway` 内嵌的 QQ Bot 子网关如何把同一个机器人
 配置同时服务三条通道**：
 
@@ -11,8 +11,9 @@
 3. WebSocket 客户端（入站）：`event_source=websocket` 的机器人由网关替它维持到
    平台的长连接，收到的事件走与 webhook 同一个 `deliver_event`。
 
-与 `observation/socket` 不同，这里的 upstream mock 是**共享的外部服务**（不由脚本
-自起），所以脚本遵守「不重置 mock 世界」的约定——详见下文「隔离与清理」。
+与上级 `observation/socket` 根目录的 socket 层演示不同，这里的 upstream mock
+是**共享的外部服务**（不由脚本自起），所以脚本遵守「不重置 mock 世界」的约定
+——详见下文「隔离与清理」。
 
 ## 目录组织
 
@@ -31,13 +32,13 @@
 `target/debug/top-gateway.exe`）由脚本自动构建。
 
 ```bash
-uv run python observation/qqbot/demo_00_three_channels.py
-uv run python observation/qqbot/demo_01_openapi_passthrough.py
-uv run python observation/qqbot/demo_02_webhook_callback.py
-uv run python observation/qqbot/demo_03_websocket_supervisor.py
+uv run python observation/socket/qqbot/demo_00_three_channels.py
+uv run python observation/socket/qqbot/demo_01_openapi_passthrough.py
+uv run python observation/socket/qqbot/demo_02_webhook_callback.py
+uv run python observation/socket/qqbot/demo_03_websocket_supervisor.py
 
 # mock 在别的地址时：
-QQBOTMOCK_BASE=http://127.0.0.1:9090 uv run python observation/qqbot/demo_03_websocket_supervisor.py
+QQBOTMOCK_BASE=http://127.0.0.1:9090 uv run python observation/socket/qqbot/demo_03_websocket_supervisor.py
 ```
 
 网关子进程固定绑定 `127.0.0.1:18198`、admin key 为演示统一的 `demo-admin-key`，
@@ -130,4 +131,5 @@ ws 状态/统计：/__admin/qqbot/* │ 事件字节原样投递        │ 平�
 - **演示注册的 bot 在结束时删除**（WS supervisor 联动停止）；`/_mock/history` 与
   `/_mock/events` 是共享流水，不做清理。
 - **网关子进程**：控制台模式 `run`、固定 `127.0.0.1:18198`、临时配置文件随进程
-  退出清空，与本机 18000 端口的既有部署、以及 `observation/socket` 的 18099 互不干扰。
+  退出清空，与本机 18000 端口的既有部署、以及 `observation/socket` 根目录演示的
+  18099 互不干扰。

@@ -6,6 +6,9 @@
 每个演示脚本自己搭建全部被测环境——mock upstream、网关子进程、面板转发监听器——
 跑完即拆，互不残留。面板只做被动的透明转发与计量，不参与协议处理。
 
+本目录还有两个子套件：`llm/`（LLM 协议透传，需要面板 token）与
+`qqbot/`（QQ Bot 三路通道，上游是共享的 QQ Bot Mock），各自有独立的 README。
+
 ## 目录组织
 
 | 脚本 | 主题 | 网关行为（被测） | upstream mock 协议 | 面板看点 |
@@ -15,8 +18,10 @@
 | `demo_02_streaming.py` | 流式转发 | chunked 透传、不缓冲 | chunked 无 Content-Length | 每块到达时间戳证明流式；2 MiB 体与 1 MiB 捕获上限（`truncated`） |
 | `demo_03_failures.py` | 失败路径 | 502 不可达 / 504 超时 / 上游 500 | 死端口、挂起连接、恒 500 | 失败会话的 tx 请求行 + rx 状态行；`errors` 计数 |
 | `demo_04_binary_protocol.py` | 二进制协议 | 体流透传（Content-Length 被 hop-by-hop 剥除后重定界） | 长度前缀二进制帧 over HTTP、raw TCP echo | 自定义解读器 `binframe` 从原始 L7 字节解帧；HTTP 包裹 vs 裸 TCP 两种会话签名 |
-| `demo_05_llm_protocols.py` | LLM 协议透传 | `/llm` 保留前缀、协议段选供应商、凭证替换、尾包 usage 记 TPM、配额耗尽 429 | OpenAI Chat Completions/Responses、Anthropic Messages（非流式 JSON + 流式 SSE） | SSE 逐行到达间隔；tx 负载里的客户端假凭证 vs mock 实收的供应商凭证；`/__admin/llm/quota` 的 TPM 与响应 usage 逐项对账；RPM/TPM 耗尽 -> 429 |
 | `_common.py` | 公共库 | — | — | token 读取、面板/网关 API 封装、网关子进程、监听器隔离约定 |
+
+LLM 协议透传的演示在 `llm/demo_05_llm_protocols.py`（共享本目录的 `_common.py`），
+QQ Bot 三路通道的演示在 `qqbot/`。
 
 ## 运行
 
@@ -24,7 +29,7 @@
 （`cargo build` 出的 `target/debug/top-gateway.exe`）与 mock upstream 由脚本自动拉起。
 
 ```bash
-# token 写在 observation/.token（已 gitignore，随时可改）：
+# token 写在 llm/.token（已 gitignore，随时可改）：
 uv run python observation/socket/demo_01_route_and_path.py
 
 # 也可用参数或环境变量覆盖：
@@ -67,26 +72,6 @@ HTTP 客户端(脚本) → 127.0.0.1:19190(SocketMeasure 监听器，计量 tx/r
 - **hop-by-hop 剥除后的重定界**（demo_04）：客户端发的 `Content-Length` 被剥除，
   上游侧改用 chunked 编码（mock 打印可见）；响应回程同理。二进制帧字节
   本身原样穿过。
-- **LLM 凭证替换在面板两侧都可对照**（demo_05）：客户端的
-  `Authorization: Bearer sk-client-fake` / `x-api-key: sk-ant-client-fake`
-  原样留在面板会话的 tx 负载里，而 mock 实收的已被换成供应商 key
-  （openai 注入 Bearer，anthropic 注入 `x-api-key` 并补默认
-  `anthropic-version: 2023-06-01`）——网关剥凭证、面板看甲乙方，互不干扰。
-- **TPM 由响应尾包回填**（demo_05）：`/__admin/llm/quota` 的 `tpm.used` 与
-  响应里的 usage 逐项对账：非流式 JSON 直接取 usage 对象，SSE 取尾包
-  （openai 汇总 data 块、anthropic 取首 `message_start` 的 input_tokens 加
-  末 `message_delta` 的 output_tokens）。流式与非流式混跑后 openai 池
-  58+43+58=159、anthropic 池 16+16=32，与 mock 写入的数值完全吻合。
-- **协议池语义与路由表无关**（demo_05）：`/llm` 是保留前缀，`/llm/{protocol}`
-  后的剩余路径原样透传——同一 `openai` 供应商既服务
-  `/v1/chat/completions` 也服务 `/v1/responses`；未知协议段 404，
-  协议池为空（全禁用）503。
-- **配额极限的三种归宿**（demo_05）：权重 = min(RPM 剩余比, TPM 剩余比)，
-  任一维度满额权重即 0；协议池内全部供应商权重 <= 0 时返回 429。用
-  `rpm_limit:1` 的 systemone 供应商（其 usage 提取是 stub、TPM 恒 0，
-  单独隔离 RPM 维度）第二次请求 -> 429；`tpm_limit:10` 的 anthropic
-  供应商单次响应即用 16 > 10，第二次请求 -> 429。429 与池为空的 503
-  是两个不同错误码。
 
 ## 隔离与清理
 
@@ -100,5 +85,7 @@ HTTP 客户端(脚本) → 127.0.0.1:19190(SocketMeasure 监听器，计量 tx/r
 
 ## token 存放
 
-`observation/.token` 已在 `.gitignore` 中，改 token 直接编辑该文件即可；
-命令行参数与环境变量 `SOCKETMEASURE_TOKEN` 优先级更高。
+`llm/.token`（即 `observation/socket/llm/.token`）已在 `.gitignore` 中，
+改 token 直接编辑该文件即可；命令行参数与环境变量 `SOCKETMEASURE_TOKEN`
+优先级更高。socket 根目录与 `llm/` 下的演示都会按
+本目录 → `llm/` → 上级 `observation/` 的顺序查找。

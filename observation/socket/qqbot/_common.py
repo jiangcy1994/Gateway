@@ -4,8 +4,8 @@
 各演示脚本共享：mock 管理端封装、网关子进程拉起（控制台模式 `run`）、
 事件投递接收器（EventSink）、WS supervisor 状态轮询、输出格式化。
 
-与 observation/socket 不同，这里的 upstream mock（QQ Bot Mock）是**共享的
-外部服务**，不由脚本自起：默认在 http://127.0.0.1:8080，可用环境变量
+与 observation/socket 根目录的 socket 层演示不同，这里的 upstream mock（QQ Bot Mock）
+是**共享的外部服务**，不由脚本自起：默认在 http://127.0.0.1:8080，可用环境变量
 QQBOTMOCK_BASE 覆盖。因此脚本遵守「不重置 mock 世界」的约定——详见
 README 的「隔离与清理」。
 """
@@ -39,7 +39,8 @@ USER_XIAOMING = "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4"   # 小明
 # 同时演示 mock 的「推送失败不重试、只记 webhook_ok=false」。
 DEAD_WEBHOOK = "http://127.0.0.1:1/qqbot/callback"
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))))   # observation/socket/qqbot/_common.py -> 仓库根
 GATEWAY_BIN = os.path.join(_REPO_ROOT, "target", "debug", "top-gateway.exe")
 
 
