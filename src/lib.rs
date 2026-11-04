@@ -24,6 +24,11 @@ use serde_json::json;
 use crate::config::Settings;
 use crate::state::AppState;
 
+/// Crate version, read at compile time from `[package] version` in `Cargo.toml`
+/// — the single source of truth. Surfaced via `GET /__admin/version`, the
+/// startup log line, and the Windows service shell.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Builds the full app: `/health` and `/__admin/*` are served by this gateway,
 /// `/llm/*` by the embedded LLM sub-gateway, `/qqbot/*` by the embedded QQ Bot
 /// sub-gateway, everything else falls through to the proxy fallback. `/llm` and
@@ -105,7 +110,7 @@ pub async fn run_with_shutdown(
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     let addr = listener.local_addr()?;
-    tracing::info!("top-gateway listening on http://{addr}");
+    tracing::info!("top-gateway {VERSION} listening on http://{addr}");
     tracing::info!("admin API at http://{addr}/__admin, docs: GET /__admin/routes");
     tracing::info!(
         "LLM sub-gateway at http://{addr}/llm/{{openai,anthropic,systemone}}/... or /llm/v1/{{endpoint}}"

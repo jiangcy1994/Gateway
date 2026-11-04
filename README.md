@@ -61,6 +61,7 @@ x-gateway-key = "..."
 | GET | `/__admin/health` | 各上游健康状态（healthy/unhealthy/disabled） |
 | GET | `/__admin/metrics` | 各路由请求数 / 并发 / 错误数 / 平均延迟 |
 | POST | `/__admin/probe` | 立即探测全部上游一次 |
+| GET | `/__admin/version` | 网关版本号（编译期取自 `Cargo.toml`） |
 | GET | `/health` | 本网关自身健康检查（无需鉴权） |
 
 示例：

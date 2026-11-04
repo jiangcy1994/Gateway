@@ -538,6 +538,35 @@ async fn route_input_round_trips_through_json() {
 }
 
 #[tokio::test]
+async fn version_endpoint_reports_cargo_version() {
+    let gw = spawn_gateway(vec![], false, Some("admin-key")).await;
+    let client = reqwest::Client::new();
+
+    // the value must come from Cargo.toml, not a hardcoded string in the code
+    let body: Value = client
+        .get(url(&gw, "/__admin/version"))
+        .header("x-admin-key", "admin-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+
+    // same auth rules as every other admin endpoint
+    assert_eq!(
+        client
+            .get(url(&gw, "/__admin/version"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+}
+
+#[tokio::test]
 async fn unknown_admin_route_is_404_not_proxied() {
     let gw = spawn_gateway(vec![], false, None).await;
     let resp = reqwest::get(url(&gw, "/__admin/nope")).await.unwrap();

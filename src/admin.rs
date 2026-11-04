@@ -55,6 +55,7 @@ pub fn admin_router() -> Router<AppState> {
         .route("/health", get(get_health))
         .route("/metrics", get(get_metrics))
         .route("/probe", post(trigger_probe))
+        .route("/version", get(get_version))
         .nest("/llm", crate::llm::admin::admin_router())
         .nest("/qqbot", crate::qqbot::admin::admin_router())
 }
@@ -189,4 +190,15 @@ async fn trigger_probe(
     require_admin(&state, &headers)?;
     state.probe_all_now().await?;
     Ok(Json(json!({ "status": "all routes healthy" })))
+}
+
+/// `GET /__admin/version` — the crate version straight from `Cargo.toml`
+/// (`crate::VERSION`), so a running gateway can be identified without
+/// inspecting the binary on disk.
+async fn get_version(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers)?;
+    Ok(Json(json!({ "version": crate::VERSION })))
 }

@@ -34,6 +34,7 @@ use windows_service::{
 use crate::config;
 use crate::logging;
 use crate::Settings;
+use crate::VERSION;
 
 /// Registered service name (used with `sc`, `net start`, and the commands
 /// below). This is also the SCM service key, so it must not contain spaces.
@@ -50,8 +51,6 @@ const C_SERVICE_DOES_NOT_EXIST: i32 = 1060;
 const C_SERVICE_NOT_ACTIVE: i32 = 1062;
 const C_NO_SERVICE_CONTROLLER: i32 = 1063;
 const C_ACCESS_DENIED: i32 = 5;
-
-const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug)]
 pub enum ShellError {
