@@ -13,7 +13,7 @@ OpenAI Responses、Anthropic Messages（各含非流式 JSON 与流式 SSE 两�
 
 | 脚本 | 主题 | 网关行为（被测） | upstream mock 协议 | 面板看点 |
 | --- | --- | --- | --- | --- |
-| `demo_05_llm_protocols.py` | LLM 协议透传 | `/llm` 保留前缀、协议段选供应商、凭证替换、尾包 usage 记 TPM、配额耗尽 429 | OpenAI Chat Completions/Responses、Anthropic Messages（非流式 JSON + 流式 SSE） | SSE 逐行到达间隔；tx 负载里的客户端假凭证 vs mock 实收的供应商凭证；`/__admin/llm/quota` 的 TPM 与响应 usage 逐项对账；RPM/TPM 耗尽 -> 429 |
+| `demo_05_llm_protocols.py` | LLM 协议透传 | `/llm` 保留前缀、显式协议段与 `/llm/v1/{端点}` 推断两种入站形态、协议段选供应商、多协议共享供应商、凭证替换、尾包 usage 记 TPM、配额耗尽 429 | OpenAI Chat Completions/Responses、Anthropic Messages（非流式 JSON + 流式 SSE） | SSE 逐行到达间隔；tx 负载里的客户端假凭证 vs mock 实收的供应商凭证；`/__admin/llm/quota` 的 TPM 与响应 usage 逐项对账；共享供应商一条配额记录跨两个协议池；RPM/TPM 耗尽 -> 429 |
 
 `_common.py` 在上级 `observation/socket/` 目录（token 读取、面板/网关 API 封装、
 网关子进程、监听器隔离约定），本目录脚本把上级目录加入 `sys.path` 复用。
@@ -45,8 +45,9 @@ providers 文件放在系统临时目录——与 `qqbot/` 子套件的 18198、
   │
   ▼
 127.0.0.1:18099 top-gateway(run)
-  │ /llm/{protocol}/... —— 保留前缀，不经路由表：
-  │   按协议段选供应商（加权 = min(RPM 剩余比, TPM 剩余比)）
+  │ /llm/{protocol}/... 或 /llm/v1/{端点} —— 保留前缀，不经路由表：
+  │   v1 按端点名闭表推断协议（chat->openai，messages->anthropic），
+  │   或显式协议段直接定池（加权 = min(RPM 剩余比, TPM 剩余比)）
   │   剥客户端凭证，注入供应商凭证（openai: Bearer；anthropic: x-api-key + anthropic-version）
   ▼
 127.0.0.1:<随机端口> LlmMockUpstream（/v1/chat/completions、/v1/responses、/v1/messages）
@@ -71,6 +72,11 @@ providers 文件放在系统临时目录——与 `qqbot/` 子套件的 18198、
   后的剩余路径原样透传——同一 `openai` 供应商既服务
   `/v1/chat/completions` 也服务 `/v1/responses`；未知协议段 404，
   协议池为空（全禁用）503。
+- **v1 端点推断是闭表、不嗅探**（demo_05）：`/llm/v1/chat/completions` 与
+  `/llm/v1/messages` 分别落到 openai / anthropic 池（SDK 只需把 base_url 指
+  `/llm/v1`）；两协议共用的端点 `/llm/v1/models` 404 并提示改用显式协议段，
+  未知端点同样 404。声明 `protocols: ["openai","anthropic"]` 的共享供应商
+  同时进两个协议池，但 quota 视图里只有一条记录——配额按供应商记一份。
 - **配额极限的三种归宿**（demo_05）：权重 = min(RPM 剩余比, TPM 剩余比)，
   任一维度满额权重即 0；协议池内全部供应商权重 <= 0 时返回 429。用
   `rpm_limit:1` 的 systemone 供应商（其 usage 提取是 stub、TPM 恒 0，

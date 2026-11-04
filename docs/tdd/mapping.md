@@ -34,6 +34,12 @@
 | `llm_forwards_anthropic_key_and_version` | `llm/forward` 后置第 6 步 | `x-api-key` 注入、`anthropic-version` 缺省注入且不覆盖客户端值 |
 | `llm_unknown_protocol_returns_404` | `llm/forward` 后置第 1 步 | 未知协议段 404，house 错误体 |
 | `llm_missing_protocol_returns_404` | `llm/forward` 后置第 1 步 | `/llm` 无协议段 404 |
+| `llm_v1_inference_routes_by_endpoint` | ADR-L12 / `infer_protocol` 闭表 | `/llm/v1/chat/completions` → openai 池 + Bearer；`/llm/v1/messages` → anthropic 池 + `x-api-key`；`/llm/V1/...` 保留原大小写转发且查询串拼接 |
+| `llm_v1_shared_provider_serves_both_protocols` | ADR-L13（`protocols` 多选） + P6 | 多协议供应商同时进两个协议池；RPM 按供应商记一份（跨协议共用）；配额快照 `protocols` 为数组且只有一条记录；耗尽 → 429 |
+| `llm_v1_ambiguous_endpoint_returns_404` | `llm/forward` 后置第 1 步（`InferError::Ambiguous`） | `/llm/v1/models` → 404 且消息提示显式协议段；随后 `/llm/openai/v1/models` → 200（显式段绕过歧义） |
+| `llm_v1_unknown_endpoint_returns_404` | `llm/forward` 后置第 1 步（`InferError::Unknown`） | 未知端点 404，消息含端点名 |
+| `llm_v1_missing_endpoint_returns_404` | `llm/forward` 后置第 1 步（v1 后无端点） | `/llm/v1` → 404「missing endpoint」 |
+| `llm_legacy_single_protocol_field_still_loads` | ADR-L13 兼容契约 + `load_providers` 后置 | 旧形态 `protocol = "openai"` 仍可加载；下次 `save_providers` 迁移为 `protocols = [...]`；两键都缺 → `ApiError::ConfigLoad` |
 | `llm_query_string_is_preserved` | `llm/forward` 后置第 5 步 | 上游 URL 保留客户端查询串 |
 | `llm_no_provider_for_protocol_returns_503` | `llm/forward` 后置第 2 步 | 协议无供应商 503 |
 | `llm_disabled_provider_is_not_selected` | `select_and_record` 后置 | 禁用供应商不参与选择 |
@@ -50,7 +56,7 @@
 | `llm_systemone_stub_forwards_without_token_counting` | ADR-L8 桩契约 | SystemOne 可路由可转发（`x-llm-provider` 头），usage 记账为 0（钉住桩行为） |
 | `llm_admin_provider_crud_and_persistence` | `llm/admin` 端点表 + `config.rs` | 供应商 CRUD、合并式 PUT（显式 `null` = 不限）、`providers.toml` 原子写回 |
 | `llm_admin_llm_endpoints_require_admin_key` | `llm/admin` 鉴权 | 沿用 `require_admin`（`X-Admin-Key` / `Bearer`） |
-| `llm_admin_rejects_invalid_provider` | `Provider::validate` 后置 + `llm/admin` 端点表 | 非法 base_url → 400；JSON 缺必填字段 → 422（axum 标准行为，与路由 API 一致） |
+| `llm_admin_rejects_invalid_provider` | `Provider::validate` 后置 + `llm/admin` 端点表 | 非法 base_url → 400；`protocols` 空 / 重复 → 400；JSON 缺必填字段 → 422（axum 标准行为，与路由 API 一致） |
 | `llm_metrics_view_reports_per_provider_stats` | `llm/admin` 指标端点 | 按供应商的请求数 / 并发 / 错误 / 延迟 |
 | `llm_coexists_with_route_table` | `llm/lib` 集成契约 | `/llm/*` 与 `routes.toml` 前缀路由共存互不影响 |
 

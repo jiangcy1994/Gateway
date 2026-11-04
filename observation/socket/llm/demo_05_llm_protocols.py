@@ -2,12 +2,16 @@
 """演示五：LLM 协议透传 —— OpenAI Chat Completions / Responses、Anthropic Messages。
 
 网关行为（/llm 子网关，与路由表无关的保留前缀）：
-  - 按协议段选供应商：openai/anthropic/systemone；未知段 -> 404，协议池空 -> 503，
-    池内全部供应商配额权重 <= 0（RPM 或 TPM 耗尽）-> 429
+  - 两种入站形态：显式协议段 /llm/{protocol}/...，或 /llm/v1/{端点} 由端点名
+    闭表推断协议（chat/completions/responses -> openai，messages -> anthropic）；
+    两协议共用的端点（models、files）与未知端点 -> 404，提示改用显式协议段
+  - 按协议选供应商：供应商声明 protocols（可多选，一份配额跨协议共用）；
+    未知协议段 -> 404，协议池空 -> 503，池内全部供应商配额权重 <= 0
+    （RPM 或 TPM 耗尽）-> 429
   - 凭证替换：客户端的 Authorization / x-api-key 一律被剥除，换成供应商的 key
     （openai 注入 Bearer，anthropic 注入 x-api-key + anthropic-version）
   - 路径原样透传：/llm/openai/v1/chat/completions 与 /llm/openai/v1/responses
-    只是同一协议段下的不同剩余路径
+    只是同一协议段下的不同剩余路径；/llm/v1 形态下转发路径恒为 /v1/...
   - 响应流式透传的同时，尾包提取 usage 记 TPM（非流式 JSON 取 usage 对象，
     SSE 取 data 块），可在 /__admin/llm/quota 对照
 
@@ -167,12 +171,14 @@ def main() -> int:
             ("demo-anthropic", "anthropic", "sk-mock-anthropic-key"),
         ):
             gw.admin(f"/llm/providers", "POST", {
-                "id": pid, "protocol": proto,
+                "id": pid, "protocols": [proto],
                 "base_url": f"http://127.0.0.1:{upstream.server_address[1]}",
                 "api_key": key, "rpm_limit": 60, "tpm_limit": 100000,
             })
         print(json.dumps(gw.admin("/llm/providers")["providers"], ensure_ascii=False, indent=2))
-        C.note("路由表里不需要任何条目：/llm 是保留前缀，协议段直接选供应商池。")
+        C.note("protocols 是数组：一个供应商可同时声明多个协议（共享一份配额），"
+               "此处各挂单协议；路由表里不需要任何条目——/llm 是保留前缀，"
+               "协议段直接选供应商池。")
 
         # ---------------------------------------------------------- 3
         C.step(3, "三个端点经网关请求（客户端一律带假凭证）")
@@ -273,11 +279,65 @@ def main() -> int:
                f"（SSE：首 input + 末 output）= {(USAGE_MS_IN + USAGE_MS_OUT) * 2}。")
 
         # ---------------------------------------------------------- 7
-        C.step(7, "配额极限：RPM 耗尽 -> 429、TPM 超限 -> 429")
+        C.step(7, "v1 端点推断与共享供应商（/llm/v1/{端点}）")
+        # /llm/v1/{端点}：端点名经闭表推断协议，SDK 可直接指 base_url=/llm/v1。
+        for tag, path, obj in (
+            ("Chat(v1 推断)", "/llm/v1/chat/completions",
+             {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}),
+            ("Messages(v1 推断)", "/llm/v1/messages",
+             {"model": "claude-3-5-sonnet-20241022", "max_tokens": 64,
+              "messages": [{"role": "user", "content": "hi"}]}),
+        ):
+            status, hdrs, data = C.http_request(
+                "127.0.0.1", ln.listen_port, "POST", path,
+                json.dumps(obj).encode(), {"Content-Type": "application/json"})
+            print(f"  {tag:18s} POST {path:24s} -> {status}"
+                  f" provider={hdrs.get('x-llm-provider')}")
+        for path in ("/llm/v1/models", "/llm/v1/wat"):
+            status, _, data = C.http_request("127.0.0.1", ln.listen_port, "POST",
+                                             path, b"{}", {"Content-Type": "application/json"})
+            print(f"  {'':18s} POST {path:24s} -> {status} {data[:76]!r}")
+        C.note("v1 推断是闭表：models/files 两协议都有 -> 404 提示显式协议段，"
+               "未知端点 -> 404；systemone 不参与推断（只能显式段访问）。"
+               "推断只决定选池与凭证注入，转发路径恒为 /v1/...。")
+
+        # 一个供应商同时侍奉两个协议：protocols 多选，配额只记一份。
+        gw.admin("/llm/providers", "POST", {
+            "id": "demo-shared", "protocols": ["openai", "anthropic"],
+            "base_url": f"http://127.0.0.1:{upstream.server_address[1]}",
+            "api_key": "sk-mock-shared", "rpm_limit": 60, "tpm_limit": 100000,
+        })
+        for pid in ("demo-openai", "demo-anthropic"):
+            gw.admin(f"/llm/providers/{pid}", "PUT", {"enabled": False})
+        for tag, path in (
+            ("openai 端点", "/llm/v1/chat/completions"),
+            ("anthropic 端点", "/llm/v1/messages"),
+        ):
+            status, hdrs, data = C.http_request(
+                "127.0.0.1", ln.listen_port, "POST", path,
+                b'{"model":"x","max_tokens":8,"messages":[]}',
+                {"Content-Type": "application/json"})
+            # mock 按上游路径记账：/llm/v1/chat/completions -> /v1/chat/completions
+            seen = SEEN_AUTH.get("/v1/" + path.split("/v1/")[-1], {})
+            cred = seen.get("x-api-key") or seen.get("authorization")
+            print(f"  共享供应商 {tag:12s} POST {path:22s} -> {status}"
+                  f" provider={hdrs.get('x-llm-provider')} mock 实收凭证={cred}")
+        q = next(x for x in gw.admin("/llm/quota")["providers"] if x["id"] == "demo-shared")
+        print(f"    demo-shared quota: protocols={q['protocols']}"
+              f" rpm used={q['rpm']['used']}/{q['rpm']['limit']}"
+              f" tpm used={q['tpm']['used']}/{q['tpm']['limit']}")
+        for pid in ("demo-openai", "demo-anthropic"):
+            gw.admin(f"/llm/providers/{pid}", "PUT", {"enabled": True})
+        C.note("demo-shared 声明两个协议：openai 端点请求注入 Bearer、anthropic "
+               "端点请求注入 x-api-key，两者共用同一份 RPM/TPM 计数——"
+               "quota 视图里只有一条记录，protocols 是数组。")
+
+        # ---------------------------------------------------------- 8
+        C.step(8, "配额极限：RPM 耗尽 -> 429、TPM 超限 -> 429")
         # RPM：systemone 的 usage 提取是 stub（恒 0，见 src/llm/usage.rs），
         # TPM 不会累积，正好 isolates RPM 这一条维度。
         gw.admin("/llm/providers", "POST", {
-            "id": "demo-tiny-rpm", "protocol": "systemone",
+            "id": "demo-tiny-rpm", "protocols": ["systemone"],
             "base_url": f"http://127.0.0.1:{upstream.server_address[1]}",
             "api_key": "sk-mock-tiny", "rpm_limit": 1, "tpm_limit": 1000,
         })
@@ -291,13 +351,15 @@ def main() -> int:
               f"（remaining={q['rpm']['remaining']}），tpm {q['tpm']['used']}/{q['tpm']['limit']}")
 
         # TPM：anthropic 协议挂一个 tpm_limit=10 的小供应商，并临时禁用
-        # demo-anthropic，让该协议池只剩它一家（否则加权选择会绕开它）。
+        # demo-anthropic 与 demo-shared，让该协议池只剩它一家
+        # （否则加权选择会绕开它）。
         gw.admin("/llm/providers", "POST", {
-            "id": "demo-tiny-tpm", "protocol": "anthropic",
+            "id": "demo-tiny-tpm", "protocols": ["anthropic"],
             "base_url": f"http://127.0.0.1:{upstream.server_address[1]}",
             "api_key": "sk-mock-tiny", "rpm_limit": 100, "tpm_limit": 10,
         })
-        gw.admin("/llm/providers/demo-anthropic", "PUT", {"enabled": False})
+        for pid in ("demo-anthropic", "demo-shared"):
+            gw.admin(f"/llm/providers/{pid}", "PUT", {"enabled": False})
         for i in (1, 2):
             status, _, data = C.http_request("127.0.0.1", ln.listen_port, "POST",
                                              "/llm/anthropic/v1/messages",
@@ -310,14 +372,17 @@ def main() -> int:
               f"（remaining={q['tpm']['remaining']}，单次响应就用了 "
               f"{USAGE_MS_IN + USAGE_MS_OUT} > 10）")
         gw.admin("/llm/providers/demo-anthropic", "PUT", {"enabled": True})
+        gw.admin("/llm/providers/demo-shared", "PUT", {"enabled": True})
         C.note("权重 = min(rpm 剩余比, tpm 剩余比)：任一维度满额该供应商权重即 0，"
                "协议池内全部供应商权重 <= 0 时返回 429（与池为空的 503 区分）。")
 
-        # ---------------------------------------------------------- 8
-        C.step(8, "清理：删供应商、停网关与监听器、停 mock")
-        for pid in ("demo-openai", "demo-anthropic", "demo-tiny-rpm", "demo-tiny-tpm"):
+        # ---------------------------------------------------------- 9
+        C.step(9, "清理：删供应商、停网关与监听器、停 mock")
+        for pid in ("demo-openai", "demo-anthropic", "demo-shared",
+                    "demo-tiny-rpm", "demo-tiny-tpm"):
             gw.admin(f"/llm/providers/{pid}", "DELETE")
-        print("  供应商 demo-openai / demo-anthropic / demo-tiny-rpm / demo-tiny-tpm 已删除")
+        print("  供应商 demo-openai / demo-anthropic / demo-shared /"
+              " demo-tiny-rpm / demo-tiny-tpm 已删除")
 
     upstream.shutdown()
     print("  网关、监听器、mock upstream 已停止")

@@ -8,26 +8,34 @@ LLM 子网关是 top-gateway 内嵌模块，代码在 `src/llm/`，与既有模�
 
 | 模块 | 职责 | 依赖 |
 |---|---|---|
-| `llm/provider.rs` | `Protocol` 枚举、`Provider` 值对象、`ProviderPatch`、`ProviderTable`（与 `router.rs` 的 `RouteTable` 同构） | `error.rs` |
+| `llm/provider.rs` | `Protocol` 枚举、`infer_protocol`（v1 端点闭表推断）、`Provider` 值对象（`protocols` 多协议）、`ProviderPatch`、`ProviderTable`（与 `router.rs` 的 `RouteTable` 同构） | `error.rs` |
 | `llm/quota.rs` | `QuotaTracker`：供应商级 60s 滚动窗口的 RPM/TPM 计数与剩余量 | 无（纯内存 + `Mutex`） |
-| `llm/balancer.rs` | `select_and_record`：按协议过滤供应商 → 加权随机 → **同临界区记 RPM** | `provider.rs`、`quota.rs`、`state.rs` |
+| `llm/balancer.rs` | `select_and_record`：按协议过滤供应商（`protocols` 含该协议）→ 加权随机 → **同临界区记 RPM** | `provider.rs`、`quota.rs`、`state.rs` |
 | `llm/usage.rs` | `TailBuffer`（尾部缓冲）+ `extract_tokens`：从响应尾包按协议提取 token 数 | `provider.rs`（`Protocol`） |
-| `llm/forward.rs` | `/llm/{protocol}/*` 转发处理器：鉴权头注入、流式转发、usage 记账 tap | 以上全部 + `proxy.rs` 的 `error_response` |
+| `llm/forward.rs` | `/llm/*` 转发处理器：解析两种入站形态（显式协议段 / `/llm/v1/{端点}` 推断）、鉴权头注入、流式转发、usage 记账 tap | 以上全部 + `proxy.rs` 的 `error_response` |
 | `llm/admin.rs` | `/__admin/llm/*` 端点（供应商 CRUD / 配额 / 指标），复用 `require_admin` | `provider.rs`、`state.rs`、`metrics.rs` |
 
 ## 请求流程
 
-### 客户端请求（`/llm/{protocol}/...`）
+### 客户端请求（`/llm/...`）
 
 ```
 build_app 把 llm::llm_router() nest 在 "/llm"
   │  其余路径照旧落到 proxy fallback（routes.toml 前缀转发）
   ▼
 forward handler（llm/forward.rs）
- 1. 解 path：剥 "/llm"，取首段为协议；未知/缺失 → 404
+ 1. 解 path：剥 "/llm"，按首段分两种入站形态（ADR-L12）：
+      • 显式协议段 /llm/{protocol}/rest —— 首段非 v1
+        首段空 / 非已知协议 → 404；剩余路径原样转发
+      • v1 推断 /llm/v1/{端点}/rest —— 首段为 v1（大小写不敏感）
+        端点首段经 infer_protocol 闭表判定：messages/complete → anthropic，
+        chat/completions/... → openai；models/files（两协议都有）→ 404 提示
+        显式段；未知端点 → 404；v1 后无端点 → 404
+        推断只决定选池与凭证注入，转发路径恒保留客户端原写法（/v1/...）
  2. state.providers.list_enabled_by_protocol(protocol) 为空 → 503
  3. balancer::select_and_record(state, protocol)
-      ├─ 逐供应商取 QuotaTracker（缺则建），按表序加锁（防死锁）
+      ├─ 候选 = protocols 含该协议的启用供应商（多协议供应商进多个池）
+      ├─ 逐供应商取 QuotaTracker（缺则建，按 provider id 存），按表序加锁（防死锁）
       ├─ 淘汰窗口外旧记录 → 算各供应商权重（见下）→ 全 0 → 429
       └─ 加权随机选中 → 同一锁内记一次 RPM → 返回 Provider（克隆）
  4. stats.guard()：RouteStats in-flight / 延迟 / 计数（RAII）

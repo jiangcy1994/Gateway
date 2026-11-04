@@ -12,4 +12,5 @@
 | R6 | **全满即 429，无排队**：客户端看到 429 的时间窗内所有供应商都在限额内 | 高峰期瞬时拒绝；客户端需自带退避重试 | 与需求「全满返 429」一致；`Retry-After` 头未在 v1 提供（后续可加，窗口剩余时间可算） | 集成测试 `llm_rpm_exhaustion_returns_429` 钉住语义 |
 | R7 | **无失败转移**（ADR-L7）：单供应商故障 → 502 | 挂多家供应商并不能躲开单家故障 | 监控 `/__admin/llm/metrics` 的 errors 计数及时下线故障供应商（`PUT` 设 `enabled:false`）；客户端重试会落到其他仍有配额的供应商 | `llm_unreachable_provider_returns_502` |
 | R8 | **`Systemone` 计量桩**（ADR-L8） | SystemOne 供应商的 TPM 计量恒为 0，按 TPM 的加权对其无效 | 桩行为有测试钉住；规格明确后只改 `usage.rs` 一个函数 | `llm_systemone_stub_forwards_without_token_counting` |
-| R9 | **同一供应商被多协议误配**：`protocol` 字段决定选择池，配错协议的供应商会被打到它不支持的协议路径 | 上游返回 4xx，透传给客户端 | `ProviderInput.protocol` 必填且校验；`x-llm-provider` 响应头让排错时能看到实际打到哪家 | `llm_forwards_openai_path_and_bearer_key` 断言响应头 |
+| R9 | **同一供应商被多协议误配**：`protocols` 字段决定选择池，配错协议的供应商会被打到它不支持的协议路径 | 上游返回 4xx，透传给客户端 | `ProviderInput.protocols` 必填且 `validate` 校验（非空、无重复）；`x-llm-provider` 响应头让排错时能看到实际打到哪家 | `llm_forwards_openai_path_and_bearer_key` 断言响应头；多协议池由 `llm_v1_shared_provider_serves_both_protocols` 钉住 |
+| R10 | **v1 端点推断是闭表**：新端点（OpenAI/Anthropic 后续新增的 API）未登记时 `/llm/v1/{新端点}` 返回 404 | 新端点要等网关升级才能经 `/llm/v1` 访问 | 闭表即确定性（ADR-L12 拒绝前缀/模糊匹配）；逃生口是无歧义的显式协议段 `/llm/{protocol}/v1/{新端点}`，不经推断 | `llm_v1_unknown_endpoint_returns_404`（404）+ `llm_v1_ambiguous_endpoint_returns_404`（404 后显式段仍 200） |

@@ -107,7 +107,9 @@ pub async fn run_with_shutdown(
     let addr = listener.local_addr()?;
     tracing::info!("top-gateway listening on http://{addr}");
     tracing::info!("admin API at http://{addr}/__admin, docs: GET /__admin/routes");
-    tracing::info!("LLM sub-gateway at http://{addr}/llm/{{openai,anthropic,systemone}}/...");
+    tracing::info!(
+        "LLM sub-gateway at http://{addr}/llm/{{openai,anthropic,systemone}}/... or /llm/v1/{{endpoint}}"
+    );
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)

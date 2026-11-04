@@ -61,7 +61,8 @@ pub struct LimitView {
 #[derive(Debug, Clone, Serialize)]
 pub struct QuotaSnapshot {
     pub id: String,
-    pub protocol: String,
+    /// 该供应商说的全部协议（多协议供应商只有一条配额记录，ADR-L13）。
+    pub protocols: Vec<String>,
     pub enabled: bool,
     pub rpm: LimitView,
     pub tpm: LimitView,
@@ -106,7 +107,7 @@ impl QuotaTracker {
     pub fn snapshot(
         &self,
         id: &str,
-        protocol: Protocol,
+        protocols: &[Protocol],
         enabled: bool,
         rpm_limit: Option<u64>,
         tpm_limit: Option<u64>,
@@ -114,7 +115,7 @@ impl QuotaTracker {
         let guard = self.lock();
         QuotaSnapshot {
             id: id.to_string(),
-            protocol: protocol.to_string(),
+            protocols: protocols.iter().map(|p| p.to_string()).collect(),
             enabled,
             rpm: LimitView {
                 limit: rpm_limit,
