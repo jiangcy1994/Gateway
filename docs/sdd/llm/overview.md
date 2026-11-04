@@ -5,7 +5,7 @@
 
 ## 一句话定义
 
-LLM 子网关是**内嵌于 top-gateway 的 LLM API 聚合层**：客户端按 OpenAI / Anthropic / SystemOne 三种协议的原生路径发到 `/llm/{protocol}/...`，网关按协议筛选供应商，依据各供应商的 RPM 与 TPM 限额（**供应商维度、跨其名下所有模型汇总**）做剩余配额加权的负载均衡，配额全部耗尽时返回 429。
+LLM 子网关是**内嵌于 top-gateway 的 LLM API 聚合层**：客户端按 OpenAI / Anthropic / SystemOne 三种协议的原生路径发到 `/llm/{protocol}/...`，或让两家 SDK 直接指 `http://gw:8000/llm/v1` 由网关**按端点推断协议**，网关再按协议筛选供应商（一个供应商可同时侍奉多个协议），依据各供应商的 RPM 与 TPM 限额（**供应商维度、跨其名下所有模型与协议汇总**）做剩余配额加权的负载均衡，配额全部耗尽时返回 429。
 
 ## 它解决什么
 
@@ -14,24 +14,28 @@ LLM 子网关是**内嵌于 top-gateway 的 LLM API 聚合层**：客户端按 O
 LLM 子网关把这件事收进网关：
 
 ```
-client (OpenAI SDK, base_url=http://gw:8000/llm/openai)
-        │  POST /llm/openai/v1/chat/completions  {"model":"gpt-4o", ...}
+client (OpenAI SDK, base_url=http://gw:8000/llm/v1)
+        │  POST /llm/v1/chat/completions      {"model":"gpt-4o", ...}
+        │  POST /llm/v1/messages              {"model":"claude...", ...}
         ▼
 top-gateway:8000
-  ├─ /llm/openai/*   ──► 选 openai 协议供应商（按剩余 RPM/TPM 加权）
-  ├─ /llm/anthropic/*──► 选 anthropic 协议供应商
-  ├─ /llm/systemone/*──► 选 systemone 协议供应商（桩：见范围外）
+  ├─ /llm/v1/{端点}  ──► 按端点闭表推断协议（chat→openai，messages→anthropic）
+  ├─ /llm/openai/*   ──► 显式选 openai 协议供应商（按剩余 RPM/TPM 加权）
+  ├─ /llm/anthropic/*──► 显式选 anthropic 协议供应商
+  ├─ /llm/systemone/*──► 显式选 systemone 协议供应商（桩：见范围外）
   ├─ /__admin/llm/*  ──► 供应商配置 / 配额查看 / 指标
   └─ 其余路径        ──► 原有 routes.toml 前缀转发（不受影响）
 ```
 
+两种入站形态并存（ADR-L12）：**SDK 直接指 `/llm/v1` 最省事**（OpenAI 与 Anthropic 的 SDK 都把 base_url 拼成 `{base}/v1/{端点}`）；需要无歧义或有歧义端点（`models`、`files` 两协议都有）时用**显式协议段** `/llm/{protocol}/...`。
+
 ## 范围内
 
-- 按**协议透传**转发：入站路径剥掉 `/llm/{protocol}` 后原样拼到供应商 `base_url`，body 与响应流式透传，不做协议转换。
-- 按协议过滤启用的供应商，**剩余配额加权随机**选择；同一临界区内完成「选择 + RPM 计数」，并发请求不会同时选中只剩 1 RPM 的供应商。
+- 按**协议透传**转发：入站路径剥掉 `/llm/{protocol}`（或 `/llm/v1/{端点}` 推断出协议后）原样拼到供应商 `base_url`，body 与响应流式透传，不做协议转换。
+- 按协议过滤启用的供应商（`protocols` **包含**该协议即入池，一个供应商可在多个协议池里），**剩余配额加权随机**选择；同一临界区内完成「选择 + RPM 计数」，并发请求不会同时选中只剩 1 RPM 的供应商。配额按**供应商**记一份，跨协议共用。
 - RPM 派遣即计数；TPM 从上游响应的 `usage` 字段**事后记账**（非流式 JSON 与 SSE 末尾 usage 均支持，best-effort）。
 - 供应商级 60 秒滚动窗口；RPM/TPM 限额均可选（`None` = 不限量）。
-- 配额全部耗尽 → `429`；该协议一个供应商都没配 → `503`；未知协议段 → `404`。
+- 配额全部耗尽 → `429`；该协议一个供应商都没配 → `503`；未知协议段 → `404`；v1 推断失败（两协议共用的端点 / 未知端点 / v1 后无端点）→ `404` 并提示改用显式协议段。
 - 供应商 CRUD 管理 API（`/__admin/llm/providers*`，与路由 CRUD 同构、合并式更新）+ 配额查看（`/__admin/llm/quota`）+ 指标（`/__admin/llm/metrics`，复用 `RouteStats`）。
 - 供应商配置原子持久化到 `GATEWAY_PROVIDERS_FILE`（默认 `providers.toml`），重启不丢失。
 - 供应商凭证按协议注入（OpenAI/SystemOne → `Authorization: Bearer`；Anthropic → `x-api-key` + 缺省 `anthropic-version`）。
@@ -50,7 +54,7 @@ top-gateway:8000
 
 | 用户 | 用法 |
 |---|---|
-| LLM 应用 | OpenAI SDK 指向 `http://gw:8000/llm/openai`；Anthropic SDK 指向 `http://gw:8000/llm/anthropic`，代码与直连官方一致 |
+| LLM 应用 | OpenAI / Anthropic SDK 都可直接指向 `http://gw:8000/llm/v1`（网关按端点推断协议）；需要无歧义场景改指 `http://gw:8000/llm/{openai\|anthropic}`，代码与直连官方一致 |
 | 服务运维 | `POST /__admin/llm/providers` 登记供应商（base_url、key、协议、rpm/tpm 限额），立即生效；`GET /__admin/llm/quota` 看各供应商分钟级余量 |
 | 监控 | 轮询 `GET /__admin/llm/metrics`（按供应商的请求数 / 并发 / 错误 / 平均延迟）与 `GET /__admin/llm/quota` |
 

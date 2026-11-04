@@ -10,19 +10,36 @@
 
 ### `Protocol`（枚举）
 
-变体 `Openai` / `Anthropic` / `Systemone`；serde 小写字符串；实现 `FromStr`（URL 段解析，错误表示未知协议）。
+变体 `Openai` / `Anthropic` / `Systemone`；serde 小写字符串。
 
 - `from_url_segment(&str) -> Option<Protocol>`：输入先转 ASCII 小写再匹配 `{openai, anthropic, systemone}`；其余 `None`。
 
+### `InferError`（枚举，ADR-L12）
+
+`/llm/v1/{端点}` 推断失败的原因：`Ambiguous`（端点两协议族都有，无法无歧义判定）/ `Unknown`（端点不在推断闭表内）。
+
+### `infer_protocol(endpoint: &str) -> Result<Protocol, InferError>`
+
+`/llm/v1/{端点}` 的端点段 → 协议推断**闭表**。输入为 `v1/` 之后的**首段**（`messages/count_tokens` 归 `messages`），先转 ASCII 小写再匹配；推断结果只用于选池与凭证注入，不改变转发路径。
+
+| 端点首段 | 推断结果 |
+|---|---|
+| `messages`、`complete` | `Anthropic` |
+| `chat`、`completions`、`responses`、`embeddings`、`moderations`、`audio`、`images`、`fine_tuning`、`batches`、`uploads`、`threads`、`assistants` | `Openai` |
+| `models`、`files` | `Err(Ambiguous)` |
+| 其余 | `Err(Unknown)` |
+
+systemone 不参与推断（只能经显式协议段 `/llm/systemone/...` 访问）。
+
 ### `Provider`（结构体）
 
-字段与不变式见 `data-model.md`（P1–P5）。实现 `Serialize/Deserialize`（TOML 与 JSON 共用同一结构）。
+字段与不变式见 `data-model.md`（P1–P6）。实现 `Serialize/Deserialize`（TOML 与 JSON 共用同一结构）。`protocols` 字段反序列化同时接受列表与**旧形态单值**（`#[serde(alias = "protocol")]`，见 ADR-L13）；序列化只产出列表形态。
 
 ### `Provider::validate(&self) -> Result<(), String>`
 
 - 前置：字段已填充。
-- 后置：全部规则通过返回 `Ok(()))`；任一失败 `Err(原因)`（管理 API 映射 400）。
-- 规则（顺序即错误优先级）：`id` 非空 → `base_url` scheme ∈ {http,https} → `base_url` host 非空 → `api_key` 非空 → `rpm_limit`/`tpm_limit` 为 `Some` 时 `> 0`。
+- 后置：全部规则通过返回 `Ok(())`；任一失败 `Err(原因)`（管理 API 映射 400）。
+- 规则（顺序即错误优先级）：`id` 非空 → `protocols` 非空 → `protocols` 无重复 → `base_url` scheme ∈ {http,https} → `base_url` host 非空 → `api_key` 非空 → `rpm_limit`/`tpm_limit` 为 `Some` 时 `> 0`。
 
 ### `Provider::apply_patch(&self, patch: ProviderPatch) -> Provider`
 
@@ -38,7 +55,7 @@
 | `add` | `(&self, Provider) -> Result<(), ApiError>` | 追加表尾 | `DuplicateId`（400） |
 | `replace` | `(&self, id: &str, Provider) -> Result<(), ApiError>` | 原地替换 | `ProviderNotFound`（404）/ `DuplicateId`（排除自身位置后比较） |
 | `remove` | `(&self, id: &str) -> Option<Provider>` | 移除并返回 | 不抛 |
-| `list_enabled_by_protocol` | `(&self, protocol) -> Vec<Provider>` | `enabled && protocol` 匹配，表内顺序 | 不抛 |
+| `list_enabled_by_protocol` | `(&self, protocol) -> Vec<Provider>` | `enabled && protocols` **包含**该协议，表内顺序；多协议供应商同时出现在多个协议池里 | 不抛 |
 
 ---
 
@@ -54,7 +71,7 @@
 | `record_tokens` | `(&self, tokens: u64)` | forward 的 usage tap | 同上；`tokens==0` 也记 |
 | `remaining_rpm` | `(&self, limit: Option<u64>) -> Option<u64>` | balancer | 先淘汰；`None` → `None`（不限）；`Some(l)` → `l.saturating_sub(used)` |
 | `remaining_tpm` | 同上 | balancer | 同上 |
-| `snapshot` | `(&self, rpm_limit, tpm_limit) -> QuotaSnapshot` | admin | 先淘汰；`used` = 窗口内条数 / token 和 |
+| `snapshot` | `(&self, id: &str, protocols: &[Protocol], enabled, rpm_limit, tpm_limit) -> QuotaSnapshot` | admin | 先淘汰；`used` = 窗口内条数 / token 和；`protocols` 为供应商声明的全部协议（多协议供应商只此一条记录） |
 
 不变式（并发）：`Mutex` 永远按 **ProviderTable 表序**获取；`select_and_record` 把所有候选 tracker 的锁**一次性全部持有**后再算权重，期间不做任何 await。
 
@@ -107,7 +124,10 @@
 
 - 前置：无。
 - 后置（按判定顺序）：
-  1. 剥掉 `/llm` 前缀取剩余 path；首段为协议段：空 → `404`（消息含提示「missing protocol segment」）；`Protocol::from_url_segment` 为 `None` → `404`（消息含未知段名）。协议段之后为剩余路径，空则补 `/`。查询串原样拼接。
+  1. 剥掉 `/llm` 前缀取剩余 path 与首段，按**两种入站形态**分流（ADR-L12）：
+     - **显式协议段** `/llm/{protocol}/rest`（首段不是 `v1`，大小写不敏感）：首段空 → `404`（「missing protocol segment」）；`Protocol::from_url_segment` 为 `None` → `404`（消息含未知段名）。剩余路径 `rest` 原样转发，空则补 `/`。
+     - **v1 推断** `/llm/v1/{端点}`（首段是 `v1`，大小写不敏感）：`v1/` 后无端点段 → `404`（「missing endpoint after v1」）；`infer_protocol(端点首段)` 为 `Err(Ambiguous)` → `404`（消息含端点名并提示改用显式协议段）；`Err(Unknown)` → `404`（消息含端点名）。推断出的协议只决定选池与凭证注入；**转发路径恒为 `/{首段原样}/{端点及剩余}`**（保留客户端的大小写写法）。systemone 永不由推断产出。
+     无论哪种形态，查询串都原样拼接。
   2. `select_and_record` 失败按其错误映射（503 / 429，house 错误体）。
   3. `state.llm_stats_for(provider.id).guard()`（Drop 记账）。
   4. 上游 URL = `base_url.trim_end_matches('/') + 剩余路径`。
@@ -138,8 +158,8 @@
 | GET | `/__admin/llm/metrics` | `200 {"providers":[{"provider":...,"stats":...}]}` | 401 |
 
 - 所有变更端点成功后先 `state.persist_providers()` 再返回；持久化失败 → 500。
-- `ProviderInput`（POST body）：`id`/`name` Option（id 省略生成），`protocol` 必填，`base_url`/`api_key` 必填，`rpm_limit`/`tpm_limit`/`enabled` Option。
-- `ProviderPatch`（PUT body）：全 Option，与 `RoutePatch` 同构的合并语义。**`rpm_limit` / `tpm_limit` 为 `Option<Option<u64>>`**：字段缺省 = 保留原值；显式 `null` = 设为不限；数字 = 设新限额。
+- `ProviderInput`（POST body）：`id`/`name` Option（id 省略生成），`protocols` 必填（接受单值或列表，见 ADR-L13），`base_url`/`api_key` 必填，`rpm_limit`/`tpm_limit`/`enabled` Option。
+- `ProviderPatch`（PUT body）：全 Option，与 `RoutePatch` 同构的合并语义。**`rpm_limit` / `tpm_limit` 为 `Option<Option<u64>>`**：字段缺省 = 保留原值；显式 `null` = 设为不限；数字 = 设新限额。`protocols` 为 `Option<Vec<Protocol>>`：缺省或显式 `null` = 保留原值；给列表（或单值）= 整体替换。
 
 ---
 

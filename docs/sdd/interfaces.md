@@ -6,6 +6,11 @@
 
 ## lib.rs
 
+### `VERSION: &str`（pub const）
+
+- 定义：`env!("CARGO_PKG_VERSION")`——编译期从 `[package] version` 读取，**版本号的唯一来源**：改 `Cargo.toml` 后重新编译即同步，代码里不出现字面量版本号。
+- 使用：`GET /__admin/version`（见 admin.rs）、启动日志 `top-gateway {VERSION} listening on ...`、Windows 服务外壳的 `run`/`status` 输出（`service.rs` 直接引用本常量，不再各存一份）。
+
 ### `build_app(state: AppState) -> Router`
 
 组装整个应用。
@@ -119,6 +124,7 @@ fallback 处理器，所有非 `/health`、非 `/__admin/*` 请求都到这里�
 | GET | `/__admin/health` | 需要 | `200 {"routes":[HealthState...]}`（按路由表顺序 join，删过的路由不残留） | 401 |
 | GET | `/__admin/metrics` | 需要 | `200 {"routes":[{"route":...,"stats":...}]}` | 401 |
 | POST | `/__admin/probe` | 需要 | `200 {"status":"all routes healthy"}` | 500（首个不健康路由，消息含原因）、401 |
+| GET | `/__admin/version` | 需要 | `200 {"version":<`Cargo.toml` 中的版本号>}` | 401 |
 | GET | `/health` | **不需要** | `200 {"status":"ok"}` | — |
 
 - `GET /__admin/routes/{id}` 的 `id` 是 URL path 段（`{id}` axum 语法），不做 URL 解码以外的处理。

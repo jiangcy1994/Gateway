@@ -12,7 +12,11 @@ enum Protocol { Openai, Anthropic, Systemone }
 
 - 序列化 / URL 协议段：`"openai"` / `"anthropic"` / `"systemone"`（全小写）。
 - URL 段匹配大小写不敏感（`/llm/OpenAI/...` 归一化为小写后匹配）。
-- **不变式 P0**：`Systemone` 参与 ProviderTable / 选择 / 转发的全部通用路径；仅 `extract_tokens` 未实现其 usage 解析（桩，ADR-L8）。
+- **不变式 P0**：`Systemone` 参与 ProviderTable / 选择 / 转发的全部通用路径；仅 `extract_tokens` 未实现其 usage 解析（桩，ADR-L8）；它也**不参与 v1 端点推断**（ADR-L12），只能经显式协议段访问。
+
+## 核心函数：`infer_protocol`（provider.rs）
+
+`/llm/v1/{端点}` 的端点首段 → `Protocol` 的闭表推断（ADR-L12）。输入先转 ASCII 小写；`messages`/`complete` → anthropic，`chat`/`completions`/`responses`/`embeddings`/`moderations`/`audio`/`images`/`fine_tuning`/`batches`/`uploads`/`threads`/`assistants` → openai，`models`/`files` → `Err(Ambiguous)`，其余 → `Err(Unknown)`。闭表封闭：新端点必须显式登记，不允许前缀/模糊匹配。
 
 ## 核心值对象：`Provider`（provider.rs）
 
@@ -22,7 +26,7 @@ enum Protocol { Openai, Anthropic, Systemone }
 |---|---|---|
 | `id` | `String` | 非空；表内唯一；`PUT` 不可改；POST 省略时自动生成 UUID v4 |
 | `name` | `String` | 展示名，默认空串 |
-| `protocol` | `Protocol` | 必填 |
+| `protocols` | `Vec<Protocol>` | 至少一个、不可重复；反序列化同时接受列表与旧形态单值（`protocol = "openai"`，ADR-L13）；序列化只产出列表 |
 | `base_url` | `String` | `http://` 或 `https://` 且含 host；不以 `/` 结尾（校验时自动 trim） |
 | `api_key` | `String` | 非空（网关按协议注入到上游请求，客户端的凭证一律被替换） |
 | `rpm_limit` | `Option<u64>` | `Some(n)` 时 `n > 0`；`None` = 不限 RPM |
@@ -38,8 +42,10 @@ enum Protocol { Openai, Anthropic, Systemone }
 | P3 | `api_key` 非空 | `Provider::validate` |
 | P4 | 限额 `Some(n)` → `n > 0` | `Provider::validate` |
 | P5 | 限额是**供应商级**的：`rpm_limit` / `tpm_limit` 描述该供应商名下所有模型共享的上限，计数不按 model 分桶 | 结构本身（`Provider` 无 model 字段） |
+| P6 | `protocols` 非空且无重复；一个供应商说多个协议时同时进入多个协议池，限额**按供应商记一份**（跨协议共用） | `Provider::validate` + tracker 按 provider id 存放（P5 的自然推论） |
 
 > 与 `Route` 同宽容策略：`load_providers` 从磁盘读到重复 id 时只告警并全部保留。
+> 字段兼容（ADR-L13）：磁盘上的旧文件若写 `protocol = "openai"` 单值仍能读入（serde alias），下一次原子写回即迁移为 `protocols = [...]`；两个键都没有则解析失败（保持缺字段的大错行为）。
 
 ## 运行期状态
 
@@ -85,7 +91,7 @@ TailBuffer { buf: Vec<u8>, cap: usize }   // cap = 64 KiB
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `id` / `protocol` / `enabled` | `String`/`String`/`bool` | 冗余自 `Provider` |
+| `id` / `protocols` / `enabled` | `String`/`Vec<String>`/`bool` | 冗余自 `Provider`；多协议供应商只此一条配额记录 |
 | `rpm` / `tpm` | `{ limit: Option<u64>, used: u64, remaining: Option<u64> }` | `limit=null` 表示不限；`remaining=null` 同义 |
 | `window_secs` | `u64` | 常量 60 |
 
@@ -96,10 +102,10 @@ TailBuffer { buf: Vec<u8>, cap: usize }   // cap = 64 KiB
 ```toml
 # top-gateway providers - managed file, rewrites drop comments
 [[providers]]
-id = "openai-official"
-name = "OpenAI"
-protocol = "openai"
-base_url = "https://api.openai.com"
+id = "shared-vendor"
+name = "Shared Vendor"
+protocols = ["openai", "anthropic"]
+base_url = "https://api.shared-vendor.example"
 api_key = "sk-..."
 rpm_limit = 500
 tpm_limit = 150000

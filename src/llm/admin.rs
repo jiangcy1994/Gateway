@@ -58,7 +58,7 @@ async fn create_provider(
     state.persist_providers()?;
     tracing::info!(
         provider = %provider.id,
-        protocol = %provider.protocol,
+        protocols = ?provider.protocols,
         base_url = %provider.base_url,
         "provider added"
     );
@@ -109,7 +109,7 @@ async fn get_quota(
         let tracker = state.quota_for(&provider.id);
         views.push(tracker.snapshot(
             &provider.id,
-            provider.protocol,
+            &provider.protocols,
             provider.enabled,
             provider.rpm_limit,
             provider.tpm_limit,

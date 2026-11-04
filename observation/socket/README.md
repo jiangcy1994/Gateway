@@ -20,7 +20,9 @@
 | `demo_04_binary_protocol.py` | 二进制协议 | 体流透传（Content-Length 被 hop-by-hop 剥除后重定界） | 长度前缀二进制帧 over HTTP、raw TCP echo | 自定义解读器 `binframe` 从原始 L7 字节解帧；HTTP 包裹 vs 裸 TCP 两种会话签名 |
 | `_common.py` | 公共库 | — | — | token 读取、面板/网关 API 封装、网关子进程、监听器隔离约定 |
 
-LLM 协议透传的演示在 `llm/demo_05_llm_protocols.py`（共享本目录的 `_common.py`），
+LLM 协议透传的演示在 `llm/`（demo_00 协议透传总览 → demo_01 SSE 流式 →
+demo_02 usage/TPM 记账 → demo_03 `/llm/v1` 端点推断 → demo_04 多协议共享供应商 →
+demo_05 配额极限，共享本目录的 `_common.py` 与目录内的 `_llm_mock.py`），
 QQ Bot 三路通道的演示在 `qqbot/`。
 
 ## 运行

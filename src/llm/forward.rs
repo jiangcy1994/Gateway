@@ -10,7 +10,7 @@ use futures_util::Stream;
 
 use crate::error::ApiError;
 use crate::llm::balancer;
-use crate::llm::provider::Protocol;
+use crate::llm::provider::{infer_protocol, InferError, Protocol};
 use crate::llm::quota::QuotaTracker;
 use crate::llm::usage::{extract_tokens, TailBuffer};
 use crate::proxy::{error_response, is_filtered};
@@ -31,28 +31,63 @@ pub async fn forward(
     let path = uri.path();
     let rest = path.strip_prefix(LLM_PREFIX).unwrap_or(path);
     let rest = rest.trim_start_matches('/');
-    let (segment, remainder) = match rest.split_once('/') {
+    let (first, remainder) = match rest.split_once('/') {
         Some((seg, rem)) => (seg, rem),
         None => (rest, ""),
     };
-    if segment.is_empty() {
+    if first.is_empty() {
         return error_response(
             StatusCode::NOT_FOUND,
             "missing protocol segment: use /llm/{protocol}/... with openai, anthropic or systemone",
         );
     }
-    let Some(protocol) = Protocol::from_url_segment(segment) else {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            &format!(
-                "unknown protocol segment '{segment}': expected openai, anthropic or systemone"
-            ),
-        );
-    };
-    let target_path = if remainder.is_empty() {
-        "/".to_string()
+
+    // 两种入站形态（ADR-L12）：
+    //   `/llm/{protocol}/...` —— 显式协议段， remainder 原样转发；
+    //   `/llm/v1/{端点}`      —— 按端点段推断协议，推断结果只影响选池与凭证注入，
+    //                            转发路径保留客户端写法（`/v1/...`）。
+    let (protocol, target_path) = if first.eq_ignore_ascii_case("v1") {
+        let Some(endpoint) = remainder.split('/').next().filter(|s| !s.is_empty()) else {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "missing endpoint after v1: use /llm/v1/{endpoint} (e.g. /llm/v1/chat/completions) or /llm/{protocol}/v1/...",
+            );
+        };
+        let protocol = match infer_protocol(endpoint) {
+            Ok(protocol) => protocol,
+            Err(InferError::Ambiguous) => {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!(
+                        "endpoint '{endpoint}' is served by both openai and anthropic: use the explicit protocol segment /llm/{{protocol}}/v1/{endpoint}"
+                    ),
+                )
+            }
+            Err(InferError::Unknown) => {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!(
+                        "cannot infer protocol from endpoint '{endpoint}': unknown endpoint; use /llm/{{protocol}}/... (openai, anthropic or systemone)"
+                    ),
+                )
+            }
+        };
+        (protocol, format!("/{first}/{remainder}"))
     } else {
-        format!("/{remainder}")
+        let Some(protocol) = Protocol::from_url_segment(first) else {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                &format!(
+                    "unknown protocol segment '{first}': expected openai, anthropic or systemone"
+                ),
+            );
+        };
+        let target_path = if remainder.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{remainder}")
+        };
+        (protocol, target_path)
     };
 
     let provider = match balancer::select_and_record(&state, protocol) {

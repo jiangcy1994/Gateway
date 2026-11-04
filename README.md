@@ -6,7 +6,7 @@ Rust 实现（axum + tokio + reqwest），与 `qqbot-api-gateway` 同一技术�
 ```
 client ──► top-gateway:8000
               ├─ /qqbot/*        ──► 内嵌 QQ Bot 网关（OpenAPI 透传 / webhook 回调 / WS 客户端）
-              ├─ /llm/*          ──► 内嵌 LLM 网关（按协议选供应商，见下文）
+              ├─ /llm/*          ──► 内嵌 LLM 网关（/llm/v1/{端点} 或 /llm/{protocol}/...，见下文）
               ├─ /svc/*          ──► 127.0.0.1:9000  （routes.toml 里挂载的子网关）
               └─ /__admin/*      ──► 本网关管理 API（不转发）
 ```
@@ -61,6 +61,7 @@ x-gateway-key = "..."
 | GET | `/__admin/health` | 各上游健康状态（healthy/unhealthy/disabled） |
 | GET | `/__admin/metrics` | 各路由请求数 / 并发 / 错误数 / 平均延迟 |
 | POST | `/__admin/probe` | 立即探测全部上游一次 |
+| GET | `/__admin/version` | 网关版本号（编译期取自 `Cargo.toml`） |
 | GET | `/health` | 本网关自身健康检查（无需鉴权） |
 
 示例：
@@ -91,18 +92,33 @@ curl -X PUT http://127.0.0.1:8000/__admin/routes/svc \
 
 ## LLM 网关（`/llm/{protocol}/*`）
 
-内嵌子网关：同一入口下按协议段选择供应商池，客户端协议原样透传（不做协议
+内嵌子网关：同一入口下按协议选择供应商池，客户端协议原样透传（不做协议
 互转），按供应商的 RPM/TPM 剩余配额加权选择；配额按**整个供应商**（底下全
-部模型合计）计算，60 秒滚动窗口。
+部模型合计）计算，60 秒滚动窗口。两种入站形态：
 
-支持的协议段：`openai`、`anthropic`、`systemone`（systemone 可路由可转发，
-仅 usage 记账为桩，暂记 0）。凭证由网关按协议注入（openai/systemone 走
-`Authorization: Bearer`，anthropic 走 `x-api-key`），客户端凭证一律被替换。
+- **`/llm/v1/{端点}`**：SDK 的 base_url 直接指 `http://gw:8000/llm/v1`，网关按
+  端点名推断协议（`chat/completions` 等 → openai，`messages` 等 → anthropic），
+  两家 SDK 无需任何配置即可接入。
+- **`/llm/{protocol}/rest`**：显式协议段，无歧义场景的逃生口。两协议共用的
+  端点（`models`、`files`）与未知端点在 `/llm/v1` 下返回 404 并提示改用此形态。
+
+一个供应商可以同时侍奉多个协议（`protocols = ["openai", "anthropic"]`，常见于
+共享网关型上游）：它同时进入两个协议池，但 RPM/TPM 配额只按供应商记一份。
+
+支持的协议段：`openai`、`anthropic`、`systemone`（systemone 仅可经显式协议段
+访问，可路由可转发，仅 usage 记账为桩，暂记 0）。凭证由网关按协议注入
+（openai/systemone 走 `Authorization: Bearer`，anthropic 走 `x-api-key`），
+客户端凭证一律被替换。
 
 ```bash
-# 客户端照常调用（以 openai 协议为例）
+# OpenAI / Anthropic SDK 直接指 /llm/v1（按端点推断协议）
+curl http://127.0.0.1:8000/llm/v1/chat/completions -d '{"model":"gpt-4o",...}'
+curl http://127.0.0.1:8000/llm/v1/messages -d '{"model":"claude-opus-4-1",...}'
+
+# 显式协议段（无歧义；v1 下推断不了的端点用这个）
 curl http://127.0.0.1:8000/llm/openai/v1/chat/completions \
   -d '{"model":"gpt-4o","messages":[...]}'
+
 # 响应头 x-llm-provider 指出本次选中的供应商
 ```
 
@@ -112,11 +128,11 @@ curl http://127.0.0.1:8000/llm/openai/v1/chat/completions \
 [[providers]]
 id = "openai-official"
 name = "OpenAI"
-protocol = "openai"             # openai | anthropic | systemone
+protocols = ["openai"]           # openai | anthropic | systemone；可多选共享配额
 base_url = "https://api.openai.com"
 api_key = "sk-..."
-rpm_limit = 60                  # 每分钟请求数限额，缺省 = 不限
-tpm_limit = 100000              # 每分钟 token 数限额，缺省 = 不限
+rpm_limit = 60                   # 每分钟请求数限额，缺省 = 不限
+tpm_limit = 100000               # 每分钟 token 数限额，缺省 = 不限
 enabled = true
 ```
 
@@ -131,8 +147,9 @@ LLM 管理端点（同样需要 `X-Admin-Key`）：
 | GET | `/__admin/llm/metrics` | 各供应商请求数 / 并发 / 错误数 / 平均延迟 |
 
 选择行为：所有供应商满 RPM 或 TPM → `429`（`QuotaExhausted`）；协议下无启用
-供应商 → `503`。TPM 由响应尾包里的 `usage` 字段事后计量（非流式取 JSON，
-流式取末尾 `data:` 块），解析不到时记 0，永不失败。
+供应商 → `503`；`/llm/v1` 下两协议共用或未登记的端点 → `404`。TPM 由响应尾包
+里的 `usage` 字段事后计量（非流式取 JSON，流式取末尾 `data:` 块），解析不到时
+记 0，永不失败。
 
 ## QQ Bot 网关（`/qqbot/*`）
 

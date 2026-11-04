@@ -67,22 +67,28 @@ preserved as `x-forwarded-host`). `Authorization` is passed through untouched �
 sub-gateways do their own client auth; route-level `headers` are injected last so
 they can override anything the client sent.
 
-LLM gateway (`src/llm/`): `/llm/{protocol}/...` selects among providers of that
-protocol (openai/anthropic/systemone), forwards the protocol **as-is** (no
-cross-protocol translation) and injects per-protocol credentials (Bearer for
-openai/systemone, `x-api-key` + default `anthropic-version` for anthropic; client
-credentials are always replaced). Selection is weighted by remaining quota —
-`weight = min(rpm_ratio, tpm_ratio)` over a 60 s rolling window, quotas counted
-per **provider** (all its models combined); all providers exhausted -> 429, none
-enabled -> 503. Selection and RPM accounting happen in one critical section with
-all trackers locked in table order (no awaits while held), so concurrent requests
-cannot over-select. TPM is counted *after the fact* from the response tail: a
-`UsageTap` stream copies chunks into a 64 KiB `TailBuffer` while streaming them
-to the client and extracts `usage` exactly once on stream end / upstream error /
-consumer drop; extraction is best-effort and never fails (missing usage records
-0). `systemone` usage extraction is a deliberate stub (always 0) — routing and
-forwarding work, accounting does not. `docs/sdd/llm/interfaces.md` is the
-implementation authority for this module.
+LLM gateway (`src/llm/`): two inbound forms — `/llm/v1/{endpoint}` infers the
+protocol from the endpoint name via a closed table (`chat/completions`... ->
+openai, `messages`/`complete` -> anthropic; `models`/`files` are ambiguous and
+404 with a hint to use the explicit form) and `/llm/{protocol}/...` is the
+unambiguous explicit form (openai/anthropic/systemone). In both cases the request
+is forwarded **as-is** (no cross-protocol translation; the v1 inference only
+decides the provider pool and credential injection) with per-protocol credentials
+(Bearer for openai/systemone, `x-api-key` + default `anthropic-version` for
+anthropic; client credentials are always replaced). A provider declares
+`protocols: Vec<Protocol>` and appears in every pool it declares, but quota is
+counted once per **provider** (all its models and protocols combined). Selection
+is weighted by remaining quota — `weight = min(rpm_ratio, tpm_ratio)` over a 60 s
+rolling window; all providers exhausted -> 429, none enabled -> 503. Selection
+and RPM accounting happen in one critical section with all trackers locked in
+table order (no awaits while held), so concurrent requests cannot over-select.
+TPM is counted *after the fact* from the response tail: a `UsageTap` stream
+copies chunks into a 64 KiB `TailBuffer` while streaming them to the client and
+extracts `usage` exactly once on stream end / upstream error / consumer drop;
+extraction is best-effort and never fails (missing usage records 0). `systemone`
+is reachable only via the explicit segment and its usage extraction is a
+deliberate stub (always 0) — routing and forwarding work, accounting does not.
+`docs/sdd/llm/interfaces.md` is the implementation authority for this module.
 
 QQ Bot gateway (`src/qqbot/`): three channels over one bot table. OpenAPI
 passthrough at `/qqbot/{app_id}/...` — the first path segment is the platform
@@ -121,7 +127,8 @@ return 503 on forwarding but **404** on the callback path (ADR-Q8).
   current value. `id` is never patchable. Same for `PUT /__admin/llm/providers/{id}`,
   where `rpm_limit`/`tpm_limit` are `Option<Option<u64>>` — absent keeps the value,
   explicit `null` sets unlimited (the `deserialize_some` recipe in
-  `src/llm/provider.rs` is what separates them; serde's default does not). Same
+  `src/llm/provider.rs` is what separates them; serde's default does not) and
+  `protocols` replaces the whole list when given. Same
   for `PUT /__admin/qqbot/bots/{id}`, where `api_base`/`ws_url`/`event_url`/
   `event_secret` are `Option<Option<String>>` — absent keeps the value, explicit
   `null` clears the override. Bot mutations also drive the WS supervisor lifecycle

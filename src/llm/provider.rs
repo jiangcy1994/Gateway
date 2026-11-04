@@ -15,6 +15,15 @@ pub enum Protocol {
     Systemone,
 }
 
+/// `/llm/v1/{端点}` 推断失败的原因（ADR-L12）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InferError {
+    /// 端点两协议族都提供（`models`、`files`），无法无歧义判定。
+    Ambiguous,
+    /// 端点不在推断闭表内。
+    Unknown,
+}
+
 impl Protocol {
     /// URL 协议段匹配，大小写不敏感（`/llm/OpenAI` 归一化为小写后匹配）。
     pub fn from_url_segment(segment: &str) -> Option<Self> {
@@ -35,6 +44,29 @@ impl Protocol {
     }
 }
 
+/// `/llm/v1/{端点}` 的端点段 → 协议推断闭表（ADR-L12）。按 **v1 之后的首段**
+/// 匹配，大小写不敏感；命中段后的剩余路径原样转发（`messages/count_tokens`
+/// 归 `messages`）。
+///
+/// - `messages`、`complete` → anthropic
+/// - `chat`、`completions`、`responses`、`embeddings`、`moderations`、`audio`、
+///   `images`、`fine_tuning`、`batches`、`uploads`、`threads`、`assistants` → openai
+/// - `models`、`files` 两协议族都有 → [`InferError::Ambiguous`]（404，要求显式协议段）
+/// - 其余 → [`InferError::Unknown`]（404）
+///
+/// systemone 不参与推断：它只能经显式协议段 `/llm/systemone/...` 访问。
+pub fn infer_protocol(endpoint: &str) -> Result<Protocol, InferError> {
+    match endpoint.to_ascii_lowercase().as_str() {
+        "messages" | "complete" => Ok(Protocol::Anthropic),
+        "chat" | "completions" | "responses" | "embeddings" | "moderations" | "audio"
+        | "images" | "fine_tuning" | "batches" | "uploads" | "threads" | "assistants" => {
+            Ok(Protocol::Openai)
+        }
+        "models" | "files" => Err(InferError::Ambiguous),
+        _ => Err(InferError::Unknown),
+    }
+}
+
 impl std::fmt::Display for Protocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
@@ -50,7 +82,11 @@ pub struct Provider {
     /// 展示名，默认空串。
     #[serde(default)]
     pub name: String,
-    pub protocol: Protocol,
+    /// 该供应商说哪些协议（至少一个、不可重复；旧形态的单值
+    /// `protocol = "openai"` 仍能读取，见 ADR-L13）。选择池 = 说该协议的
+    /// 全部启用供应商；一个供应商可同时进多个协议池。
+    #[serde(alias = "protocol", deserialize_with = "deserialize_protocols")]
+    pub protocols: Vec<Protocol>,
     /// `http://` 或 `https://` 且含 host；不以 `/` 结尾（校验时 trim）。
     pub base_url: String,
     /// 非空。网关按协议注入到上游请求，客户端的凭证一律被替换。
@@ -70,14 +106,111 @@ fn default_true() -> bool {
     true
 }
 
-/// POST body：`id`/`name` 可省略；`protocol`/`base_url`/`api_key` 必填；
+/// 兼容旧形态：单值 `protocol = "openai"` 与列表 `protocols = ["openai"]` 都能
+/// 读进来；序列化只产出列表形态（字段重命名后，旧 TOML 也不该启动失败）。
+fn deserialize_protocols<'de, D>(deserializer: D) -> Result<Vec<Protocol>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ProtocolsVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for ProtocolsVisitor {
+        type Value = Vec<Protocol>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "an LLM protocol or a list of LLM protocols")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Protocol::from_url_segment(v)
+                .map(|p| vec![p])
+                .ok_or_else(|| {
+                    E::custom(format!(
+                        "unknown protocol '{v}': expected openai, anthropic or systemone"
+                    ))
+                })
+        }
+
+        fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+            self.visit_str(&v)
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(protocol) = seq.next_element::<Protocol>()? {
+                out.push(protocol);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_any(ProtocolsVisitor)
+}
+
+/// 与 [`deserialize_protocols`] 同样的单值/列表兼容，再包一层 Option 表达
+/// PUT 的"缺省 = 保留"。显式 `null` 与缺省同义（保留原值）。
+fn deserialize_protocols_opt<'de, D>(deserializer: D) -> Result<Option<Vec<Protocol>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptProtocolsVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for OptProtocolsVisitor {
+        type Value = Option<Vec<Protocol>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "null, an LLM protocol, or a list of LLM protocols")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Protocol::from_url_segment(v)
+                .map(|p| Some(vec![p]))
+                .ok_or_else(|| {
+                    E::custom(format!(
+                        "unknown protocol '{v}': expected openai, anthropic or systemone"
+                    ))
+                })
+        }
+
+        fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+            self.visit_str(&v)
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(protocol) = seq.next_element::<Protocol>()? {
+                out.push(protocol);
+            }
+            Ok(Some(out))
+        }
+    }
+
+    deserializer.deserialize_any(OptProtocolsVisitor)
+}
+
+/// POST body：`id`/`name` 可省略；`protocols`/`base_url`/`api_key` 必填；
 /// 限额省略 = 不限；`enabled` 省略 = true。
 #[derive(Debug, Deserialize)]
 pub struct ProviderInput {
     pub id: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
-    pub protocol: Protocol,
+    #[serde(alias = "protocol", deserialize_with = "deserialize_protocols")]
+    pub protocols: Vec<Protocol>,
     pub base_url: String,
     pub api_key: String,
     #[serde(default)]
@@ -94,8 +227,13 @@ pub struct ProviderInput {
 pub struct ProviderPatch {
     #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
-    pub protocol: Option<Protocol>,
+    /// 缺省（含显式 `null`）= 保留原值；给列表 = 整体替换。
+    #[serde(
+        default,
+        alias = "protocol",
+        deserialize_with = "deserialize_protocols_opt"
+    )]
+    pub protocols: Option<Vec<Protocol>>,
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
@@ -123,6 +261,19 @@ impl Provider {
     pub fn validate(&self) -> Result<(), String> {
         if self.id.trim().is_empty() {
             return Err("id must not be empty".into());
+        }
+        if self.protocols.is_empty() {
+            return Err("protocols must not be empty".into());
+        }
+        let mut known = Vec::new();
+        for protocol in &self.protocols {
+            if known.contains(protocol) {
+                return Err(format!(
+                    "protocols must not contain duplicate '{}'",
+                    protocol
+                ));
+            }
+            known.push(*protocol);
         }
         let mut scheme_host = self.base_url.split("://");
         let scheme = scheme_host.next().unwrap_or_default().to_ascii_lowercase();
@@ -153,7 +304,7 @@ impl Provider {
         Provider {
             id: self.id.clone(),
             name: patch.name.unwrap_or_else(|| self.name.clone()),
-            protocol: patch.protocol.unwrap_or(self.protocol),
+            protocols: patch.protocols.unwrap_or_else(|| self.protocols.clone()),
             base_url: patch.base_url.unwrap_or_else(|| self.base_url.clone()),
             api_key: patch.api_key.unwrap_or_else(|| self.api_key.clone()),
             rpm_limit: patch.rpm_limit.unwrap_or(self.rpm_limit),
@@ -172,7 +323,7 @@ impl From<ProviderInput> for Provider {
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| Uuid::new_v4().to_string()),
             name: input.name.unwrap_or_default(),
-            protocol: input.protocol,
+            protocols: input.protocols,
             base_url: input.base_url,
             api_key: input.api_key,
             rpm_limit: input.rpm_limit,
@@ -250,13 +401,14 @@ impl ProviderTable {
         Some(table.remove(pos))
     }
 
-    /// `enabled && protocol` 匹配，表内顺序——转发热路径的入口。
+    /// `enabled && protocols 含该协议` 匹配，表内顺序——转发热路径的入口。
+    /// 一个供应商说多个协议时就同时出现在多个协议池里（ADR-L13）。
     pub fn list_enabled_by_protocol(&self, protocol: Protocol) -> Vec<Provider> {
         self.providers
             .read()
             .unwrap()
             .iter()
-            .filter(|p| p.enabled && p.protocol == protocol)
+            .filter(|p| p.enabled && p.protocols.contains(&protocol))
             .cloned()
             .collect()
     }

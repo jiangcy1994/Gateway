@@ -34,7 +34,21 @@ fn provider(id: &str, protocol: Protocol, base_url: &str) -> Provider {
     Provider {
         id: id.to_string(),
         name: id.to_string(),
-        protocol,
+        protocols: vec![protocol],
+        base_url: base_url.to_string(),
+        api_key: format!("key-{id}"),
+        rpm_limit: None,
+        tpm_limit: None,
+        enabled: true,
+    }
+}
+
+/// 多协议供应商（ADR-L13）：说 openai + anthropic 两套端点。
+fn multi_protocol_provider(id: &str, base_url: &str) -> Provider {
+    Provider {
+        id: id.to_string(),
+        name: id.to_string(),
+        protocols: vec![Protocol::Openai, Protocol::Anthropic],
         base_url: base_url.to_string(),
         api_key: format!("key-{id}"),
         rpm_limit: None,
@@ -316,6 +330,195 @@ async fn llm_missing_protocol_returns_404() {
         .as_str()
         .unwrap()
         .contains("missing protocol segment"));
+}
+
+/// `/llm/v1/{端点}`：按端点段推断协议（ADR-L12）——同一上游、两个各自单协议的
+/// 供应商，请求该落在哪个池里由端点决定，凭证注入也按推断结果走。
+#[tokio::test]
+async fn llm_v1_inference_routes_by_endpoint() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![
+        provider("openai-official", Protocol::Openai, &upstream),
+        provider("anthropic-official", Protocol::Anthropic, &upstream),
+    ])
+    .await;
+
+    // chat/completions → openai 池：Bearer 注入、路径以 /v1 开头
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/v1/chat/completions"))
+        .header("authorization", "Bearer client-key")
+        .json(&json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-llm-provider"], "openai-official");
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["path"], "/v1/chat/completions");
+    assert_eq!(v["echo"]["authorization"], "Bearer key-openai-official");
+
+    // messages → anthropic 池：x-api-key + 默认 anthropic-version
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/v1/messages"))
+        .json(&json!({"model": "claude-3-5-sonnet", "max_tokens": 16, "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-llm-provider"], "anthropic-official");
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["echo"]["x-api-key"], "key-anthropic-official");
+    assert_eq!(v["echo"]["anthropic-version"], "2023-06-01");
+
+    // 推断只影响选池与凭证，转发路径保留客户端写法（大小写原样）
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/V1/chat/completions?top_k=1"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-llm-provider"], "openai-official");
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["path"], "/V1/chat/completions");
+    assert_eq!(v["query"], "top_k=1");
+}
+
+/// 一个供应商说 openai + anthropic 两套端点（ADR-L13）：两个协议池都选它，
+/// RPM/TPM 只记一份——同一分钟内两协议共用配额。
+#[tokio::test]
+async fn llm_v1_shared_provider_serves_both_protocols() {
+    let upstream = spawn_mock_llm().await;
+    let mut shared = multi_protocol_provider("shared", &upstream);
+    shared.rpm_limit = Some(3);
+    let gw = spawn_llm_gateway(vec![shared]).await;
+
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/v1/chat/completions"))
+        .json(&json!({"model": "gpt-4o", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-llm-provider"], "shared");
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["echo"]["authorization"],
+        "Bearer key-shared"
+    );
+
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/v1/messages"))
+        .json(&json!({"model": "claude", "max_tokens": 16, "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["echo"]["x-api-key"],
+        "key-shared"
+    );
+
+    // 显式协议段同样落进这个供应商（两个池都是它）
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/openai/v1/chat/completions"))
+        .json(&json!({"model": "gpt-4o", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-llm-provider"], "shared");
+
+    // 三次请求后 rpm 已用满（跨两个协议共用 3 的限额）-> 第 4 次 429
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/v1/chat/completions"))
+        .json(&json!({"model": "gpt-4o", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429);
+    let err = error_body(resp).await;
+    assert_eq!(err["code"], 429);
+
+    let q = quota_view(&gw, "shared").await;
+    assert_eq!(q["protocols"], json!(["openai", "anthropic"]));
+    assert_eq!(q["rpm"]["used"], 3);
+    assert_eq!(q["rpm"]["remaining"], 0);
+}
+
+#[tokio::test]
+async fn llm_v1_ambiguous_endpoint_returns_404() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![multi_protocol_provider("shared", &upstream)]).await;
+
+    // models 两协议族都有：无法无歧义判定，要求显式协议段
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/v1/models"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let err = error_body(resp).await;
+    let msg = err["message"].as_str().unwrap();
+    assert!(
+        msg.contains("models"),
+        "message should name the endpoint: {msg}"
+    );
+    assert!(
+        msg.contains("explicit protocol segment"),
+        "message should hint at the explicit form: {msg}"
+    );
+
+    // 显式段下同一端点可正常路由（剥歧义）
+    let resp = authed()
+        .get(gateway_url(&gw, "/llm/openai/v1/models"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn llm_v1_unknown_endpoint_returns_404() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![multi_protocol_provider("shared", &upstream)]).await;
+
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/v1/wat"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let err = error_body(resp).await;
+    let msg = err["message"].as_str().unwrap();
+    assert!(
+        msg.contains("wat"),
+        "message should name the endpoint: {msg}"
+    );
+    assert!(
+        msg.contains("cannot infer protocol"),
+        "message should say inference failed: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn llm_v1_missing_endpoint_returns_404() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![multi_protocol_provider("shared", &upstream)]).await;
+
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/v1"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let err = error_body(resp).await;
+    assert!(err["message"]
+        .as_str()
+        .unwrap()
+        .contains("missing endpoint"));
 }
 
 #[tokio::test]
@@ -640,7 +843,7 @@ async fn llm_admin_provider_crud_and_persistence() {
         .post(format!("{base}/__admin/llm/providers"))
         .header("X-Admin-Key", ADMIN_KEY)
         .json(&json!({
-            "name": "OpenAI", "protocol": "openai",
+            "name": "OpenAI", "protocols": ["openai"],
             "base_url": upstream, "api_key": "sk-test",
             "rpm_limit": 60, "tpm_limit": 10000,
         }))
@@ -650,7 +853,7 @@ async fn llm_admin_provider_crud_and_persistence() {
         .json()
         .await
         .unwrap();
-    assert_eq!(created["protocol"], "openai");
+    assert_eq!(created["protocols"], json!(["openai"]));
     assert_eq!(created["rpm_limit"], 60);
     let id = created["id"].as_str().unwrap().to_string();
 
@@ -742,7 +945,7 @@ async fn llm_admin_rejects_invalid_provider() {
     let resp = client
         .post(format!("{base}/__admin/llm/providers"))
         .header("X-Admin-Key", ADMIN_KEY)
-        .json(&json!({"protocol": "openai", "base_url": "ftp://x", "api_key": "k"}))
+        .json(&json!({"protocols": ["openai"], "base_url": "ftp://x", "api_key": "k"}))
         .send()
         .await
         .unwrap();
@@ -752,17 +955,34 @@ async fn llm_admin_rejects_invalid_provider() {
     let resp = client
         .post(format!("{base}/__admin/llm/providers"))
         .header("X-Admin-Key", ADMIN_KEY)
-        .json(&json!({"protocol": "openai", "base_url": "http://up"}))
+        .json(&json!({"protocols": ["openai"], "base_url": "http://up"}))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 422);
 
+    // protocols 空列表 / 重复协议 → 400
+    for bad in [
+        json!({"id": "bad", "protocols": [], "base_url": "http://up", "api_key": "k"}),
+        json!({"id": "bad", "protocols": ["openai", "openai"], "base_url": "http://up", "api_key": "k"}),
+    ] {
+        let resp = client
+            .post(format!("{base}/__admin/llm/providers"))
+            .header("X-Admin-Key", ADMIN_KEY)
+            .json(&bad)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "payload {bad} should be rejected");
+    }
+
     // 重复 id
     let created: Value = client
         .post(format!("{base}/__admin/llm/providers"))
         .header("X-Admin-Key", ADMIN_KEY)
-        .json(&json!({"id": "dup", "protocol": "openai", "base_url": "http://up", "api_key": "k"}))
+        .json(
+            &json!({"id": "dup", "protocols": ["openai"], "base_url": "http://up", "api_key": "k"}),
+        )
         .send()
         .await
         .unwrap()
@@ -773,11 +993,62 @@ async fn llm_admin_rejects_invalid_provider() {
     let resp = client
         .post(format!("{base}/__admin/llm/providers"))
         .header("X-Admin-Key", ADMIN_KEY)
-        .json(&json!({"id": "dup", "protocol": "openai", "base_url": "http://up", "api_key": "k"}))
+        .json(
+            &json!({"id": "dup", "protocols": ["openai"], "base_url": "http://up", "api_key": "k"}),
+        )
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
+}
+
+/// 旧形态 `protocol = "openai"`（单值）仍能读入，免得字段改名让已部署的
+/// providers.toml 启动失败（ADR-L13）。两个键都没有则报错，与改名前缺字段一致。
+#[tokio::test]
+async fn llm_legacy_single_protocol_field_still_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("providers.toml");
+    std::fs::write(
+        &path,
+        [
+            "# top-gateway providers - managed file, rewrites drop comments",
+            "[[providers]]",
+            "id = 'legacy'",
+            "name = 'Legacy'",
+            "protocol = 'openai'",
+            "base_url = 'http://127.0.0.1:9'",
+            "api_key = 'k'",
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let loaded = config::load_providers(&path).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].id, "legacy");
+    assert_eq!(loaded[0].protocols, vec![Protocol::Openai]);
+
+    // 一次原子写后即迁移为新形态：列表形式
+    config::save_providers(&path, &loaded).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("protocols = ["));
+    assert!(!text.contains("protocol ="));
+
+    // 两个键都没有 → 启动失败（保持缺字段的大错行为，不悄悄给空列表）
+    let broken = dir.path().join("broken.toml");
+    std::fs::write(
+        &broken,
+        [
+            "[[providers]]",
+            "id = 'x'",
+            "base_url = 'http://u'",
+            "api_key = 'k'",
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    let err = config::load_providers(&broken).unwrap_err();
+    assert!(matches!(err, top_gateway::error::ApiError::ConfigLoad(_)));
 }
 
 #[tokio::test]
