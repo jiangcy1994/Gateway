@@ -73,6 +73,41 @@ impl std::fmt::Display for Protocol {
     }
 }
 
+/// 一个供应商对外提供的一个**网关侧模型名**（ADR-L14）。`name` 是客户端
+/// 与 app 组合里写的名字，`upstream` 是转发时改写进去的该供应商真实模型名。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Model {
+    /// 网关模型名；非空；同一 provider 内唯一（跨 provider 可重复）。
+    pub name: String,
+    /// 上游真实模型名；缺省 = `name`；给值时非空。
+    #[serde(default)]
+    pub upstream: Option<String>,
+    /// 越大越优先；balancer 分层使用（ADR-L16）。
+    #[serde(default)]
+    pub priority: i32,
+}
+
+impl Model {
+    /// 转发时写入上游 body 的模型名：`upstream` 缺省回落到 `name`。
+    pub fn upstream_name(&self) -> &str {
+        self.upstream.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// 选择候选（`pool_for` 产出）：供应商 + 该 (provider, model) 条目的
+/// effective priority 与上游模型名。空模型表的兜底供应商 priority 为
+/// `i32::MIN`、upstream 为 `None`（不改写 body）。
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub provider: Provider,
+    pub priority: i32,
+    pub upstream: Option<String>,
+}
+
+/// 空模型表兜底供应商的 effective priority（ADR-L14/L16）：任何显式声明
+/// （即便是 `priority = i32::MIN`）都优先于兜底。
+pub const CATCHALL_PRIORITY: i32 = i32::MIN;
+
 /// 一个 LLM 供应商。TOML 文件、管理 API、内存表三处共用同一表示
 /// （与 `Route` 同构的共享表示原则）。
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -97,6 +132,15 @@ pub struct Provider {
     /// `Some(n)`（`n > 0`）= 每分钟 token 数限额；`None` = 不限。
     #[serde(default)]
     pub tpm_limit: Option<u64>,
+    /// 模型表（ADR-L14）。**空表 = 协议级兜底**：参与任意 model 请求的选择、
+    /// 不改写 `model` 字段，effective priority 为 [`CATCHALL_PRIORITY`]。
+    /// 缺省空表——不带模型表的旧配置与旧测试继续工作。
+    #[serde(default)]
+    pub models: Vec<Model>,
+    /// `Some(n)`（`n > 0`）= 该供应商的单请求超时秒数；`None` = 回落全局
+    /// `GATEWAY_DEFAULT_TIMEOUT`（ADR-L17）。
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
     /// `false` 时该供应商被选择排除（协议池全禁 → 503）。
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -203,7 +247,8 @@ where
 }
 
 /// POST body：`id`/`name` 可省略；`protocols`/`base_url`/`api_key` 必填；
-/// 限额省略 = 不限；`enabled` 省略 = true。
+/// 限额省略 = 不限；`models` 省略 = 空表；`timeout_secs` 省略 = 全局默认；
+/// `enabled` 省略 = true。
 #[derive(Debug, Deserialize)]
 pub struct ProviderInput {
     pub id: Option<String>,
@@ -218,11 +263,16 @@ pub struct ProviderInput {
     #[serde(default)]
     pub tpm_limit: Option<u64>,
     #[serde(default)]
+    pub models: Vec<Model>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
     pub enabled: Option<bool>,
 }
 
-/// PUT body：全 Option 合并语义。`rpm_limit`/`tpm_limit` 为 `Option<Option<u64>>`——
-/// 字段缺省 = 保留原值；显式 `null` = 设为不限；数字 = 设新限额。
+/// PUT body：全 Option 合并语义。`rpm_limit`/`tpm_limit`/`timeout_secs` 为
+/// `Option<Option<u64>>`——字段缺省 = 保留原值；显式 `null` = 设为不限/全局默认；
+/// 数字 = 设新值。
 #[derive(Debug, Default, Deserialize)]
 pub struct ProviderPatch {
     #[serde(default)]
@@ -242,6 +292,11 @@ pub struct ProviderPatch {
     pub rpm_limit: Option<Option<u64>>,
     #[serde(default, deserialize_with = "deserialize_some")]
     pub tpm_limit: Option<Option<u64>>,
+    /// 缺省 = 保留原值；给列表 = 整体替换（不做条目级合并）。
+    #[serde(default)]
+    pub models: Option<Vec<Model>>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub timeout_secs: Option<Option<u64>>,
     #[serde(default)]
     pub enabled: Option<bool>,
 }
@@ -295,6 +350,32 @@ impl Provider {
                 }
             }
         }
+        if let Some(n) = self.timeout_secs {
+            if n == 0 {
+                return Err("timeout_secs must be greater than 0".into());
+            }
+        }
+        let mut known = Vec::new();
+        for model in &self.models {
+            if model.name.trim().is_empty() {
+                return Err("models must not have empty names".into());
+            }
+            if known.contains(&model.name) {
+                return Err(format!(
+                    "models must not contain duplicate '{}'",
+                    model.name
+                ));
+            }
+            known.push(model.name.clone());
+            if let Some(upstream) = &model.upstream {
+                if upstream.trim().is_empty() {
+                    return Err(format!(
+                        "model '{}' must not have an empty upstream",
+                        model.name
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -309,6 +390,8 @@ impl Provider {
             api_key: patch.api_key.unwrap_or_else(|| self.api_key.clone()),
             rpm_limit: patch.rpm_limit.unwrap_or(self.rpm_limit),
             tpm_limit: patch.tpm_limit.unwrap_or(self.tpm_limit),
+            models: patch.models.unwrap_or_else(|| self.models.clone()),
+            timeout_secs: patch.timeout_secs.unwrap_or(self.timeout_secs),
             enabled: patch.enabled.unwrap_or(self.enabled),
         }
     }
@@ -328,6 +411,8 @@ impl From<ProviderInput> for Provider {
             api_key: input.api_key,
             rpm_limit: input.rpm_limit,
             tpm_limit: input.tpm_limit,
+            models: input.models,
+            timeout_secs: input.timeout_secs,
             enabled: input.enabled.unwrap_or(true),
         }
     }
@@ -411,5 +496,41 @@ impl ProviderTable {
             .filter(|p| p.enabled && p.protocols.contains(&protocol))
             .cloned()
             .collect()
+    }
+
+    /// 带 model 的选择池（ADR-L14/L16）：`enabled && protocols 含该协议 &&
+    /// (models 空 || 声明了 model)`，表内顺序。每条候选给出 effective priority
+    /// （声明条目的 `priority`；空模型表兜底 = [`CATCHALL_PRIORITY`]）与
+    /// 上游模型名（声明条目的 `upstream`；空表 = `None`，不改写 body）。
+    pub fn pool_for(&self, protocol: Protocol, model: &str) -> Vec<Candidate> {
+        self.providers
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|p| p.enabled && p.protocols.contains(&protocol))
+            .filter_map(|p| match p.models.iter().find(|m| m.name == model) {
+                Some(entry) => Some(Candidate {
+                    provider: p.clone(),
+                    priority: entry.priority,
+                    upstream: entry.upstream.clone(),
+                }),
+                None if p.models.is_empty() => Some(Candidate {
+                    provider: p.clone(),
+                    priority: CATCHALL_PRIORITY,
+                    upstream: None,
+                }),
+                None => None,
+            })
+            .collect()
+    }
+
+    /// 全表**任意**供应商（含 disabled）声明了该 model——用于区分
+    /// `ModelNotFound`（404）与 `NoProviderForModel`（503）。
+    pub fn declares_model(&self, model: &str) -> bool {
+        self.providers
+            .read()
+            .unwrap()
+            .iter()
+            .any(|p| p.models.iter().any(|m| m.name == model))
     }
 }

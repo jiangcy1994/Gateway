@@ -75,6 +75,7 @@ fn test_settings(routes_path: PathBuf, admin_key: Option<&str>) -> Settings {
         routes_file: routes_path,
         providers_file: std::path::PathBuf::from("providers.toml"),
         bots_file: std::path::PathBuf::from("bots.toml"),
+        apps_file: std::path::PathBuf::from("apps.toml"),
         health_interval_secs: 1,
         health_timeout_secs: 2,
         default_timeout_secs: 30,

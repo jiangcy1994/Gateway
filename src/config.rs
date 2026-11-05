@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
+use crate::llm::app::{App, AppsFile};
 use crate::llm::provider::{Provider, ProvidersFile};
 use crate::qqbot::bot::{Bot, BotsFile};
 use crate::router::Route;
@@ -24,6 +25,8 @@ pub struct Settings {
     pub providers_file: std::path::PathBuf,
     /// Path of the TOML file holding the QQ bots（ADR-Q1：独立配置面）。
     pub bots_file: std::path::PathBuf,
+    /// Path of the TOML file holding the LLM apps（ADR-L18：独立配置面）。
+    pub apps_file: std::path::PathBuf,
     /// Interval between background health checks of every enabled route.
     pub health_interval_secs: u64,
     /// Per-request timeout for a single health probe.
@@ -105,6 +108,7 @@ impl Settings {
             routes_file: resolve_path("GATEWAY_ROUTES_FILE", "routes.toml", &base),
             providers_file: resolve_path("GATEWAY_PROVIDERS_FILE", "providers.toml", &base),
             bots_file: resolve_path("GATEWAY_BOTS_FILE", "bots.toml", &base),
+            apps_file: resolve_path("GATEWAY_APPS_FILE", "apps.toml", &base),
             health_interval_secs: env_u64("GATEWAY_HEALTH_INTERVAL_SECS", 10),
             health_timeout_secs: env_u64("GATEWAY_HEALTH_TIMEOUT_SECS", 2),
             default_timeout_secs: env_u64("GATEWAY_DEFAULT_TIMEOUT_SECS", 30),
@@ -267,6 +271,61 @@ pub fn save_bots(path: &std::path::Path, bots: &[Bot]) -> Result<(), ApiError> {
     })
     .map_err(|e| ApiError::Persist(format!("serialize bots: {e}")))?;
     let body = format!("# top-gateway bots - managed file, rewrites drop comments\n{text}");
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .map_err(|e| ApiError::Persist(format!("create temp file in {}: {e}", dir.display())))?;
+    use std::io::Write;
+    tmp.write_all(body.as_bytes())
+        .map_err(|e| ApiError::Persist(format!("write temp file: {e}")))?;
+    tmp.persist(path)
+        .map_err(|e| ApiError::Persist(format!("replace {}: {e}", path.display())))?;
+    Ok(())
+}
+
+/// Loads apps from the TOML file. A missing file is not an error: startup
+/// proceeds with no apps（与 `load_routes`/`load_providers`/`load_bots` 同策略，
+/// ADR-L18）。重复 id 或 key 只告警、全部保留。
+pub fn load_apps(path: &std::path::Path) -> Result<Vec<App>, ApiError> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let file: AppsFile = toml::from_str(&text)
+                .map_err(|e| ApiError::ConfigLoad(format!("{}: {e}", path.display())))?;
+            let mut seen_ids = std::collections::HashSet::new();
+            let mut seen_keys = std::collections::HashSet::new();
+            for app in &file.apps {
+                if !seen_ids.insert(app.id.clone()) {
+                    tracing::warn!(
+                        "duplicate app id {} in {}, keeping both",
+                        app.id,
+                        path.display()
+                    );
+                }
+                if !seen_keys.insert(app.key.clone()) {
+                    tracing::warn!("duplicate app key in {}, keeping both", path.display());
+                }
+            }
+            Ok(file.apps)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                "apps file {} not found; starting with no apps",
+                path.display()
+            );
+            Ok(Vec::new())
+        }
+        Err(e) => Err(ApiError::ConfigLoad(format!("{}: {e}", path.display()))),
+    }
+}
+
+/// Serializes all apps and replaces the apps file atomically（与
+/// `save_bots` 同策略；`key` 明文落盘——它是凭证，与 providers 的
+/// `api_key` 同级处理）。
+pub fn save_apps(path: &std::path::Path, apps: &[App]) -> Result<(), ApiError> {
+    let text = toml::to_string_pretty(&AppsFile {
+        apps: apps.to_vec(),
+    })
+    .map_err(|e| ApiError::Persist(format!("serialize apps: {e}")))?;
+    let body = format!("# top-gateway apps - managed file, rewrites drop comments\n{text}");
     let dir = path.parent().unwrap_or(std::path::Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir)
         .map_err(|e| ApiError::Persist(format!("create temp file in {}: {e}", dir.display())))?;

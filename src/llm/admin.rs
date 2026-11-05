@@ -7,6 +7,7 @@ use serde_json::json;
 
 use crate::admin::require_admin;
 use crate::error::ApiError;
+use crate::llm::app::{App, AppInput, AppPatch};
 use crate::llm::provider::{Provider, ProviderInput, ProviderPatch};
 use crate::state::AppState;
 
@@ -20,6 +21,11 @@ pub fn admin_router() -> Router<AppState> {
             get(get_provider)
                 .put(update_provider)
                 .delete(delete_provider),
+        )
+        .route("/apps", get(list_apps).post(create_app))
+        .route(
+            "/apps/{id}",
+            get(get_app).put(update_app).delete(delete_app),
         )
         .route("/quota", get(get_quota))
         .route("/metrics", get(get_metrics))
@@ -95,6 +101,78 @@ async fn delete_provider(
     }
     state.persist_providers()?;
     tracing::info!(provider = %id, "provider removed");
+    Ok(Json(json!({ "deleted": id })))
+}
+
+async fn list_apps(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers)?;
+    Ok(Json(json!({ "apps": state.apps.list() })))
+}
+
+async fn get_app(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers)?;
+    let app = state
+        .apps
+        .get(&id)
+        .ok_or_else(|| ApiError::AppNotFound(id.clone()))?;
+    Ok(Json(app))
+}
+
+async fn create_app(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<AppInput>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers)?;
+    let app: App = input.into();
+    app.validate().map_err(ApiError::InvalidApp)?;
+    state.apps.add(app.clone())?;
+    state.persist_apps()?;
+    tracing::info!(
+        app = %app.id,
+        models = app.models.len(),
+        "app added"
+    );
+    Ok((StatusCode::CREATED, Json(app)))
+}
+
+async fn update_app(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(patch): Json<AppPatch>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers)?;
+    let current = state
+        .apps
+        .get(&id)
+        .ok_or_else(|| ApiError::AppNotFound(id.clone()))?;
+    let updated = current.apply_patch(patch);
+    updated.validate().map_err(ApiError::InvalidApp)?;
+    state.apps.replace(&id, updated.clone())?;
+    state.persist_apps()?;
+    tracing::info!(app = %id, "app updated");
+    Ok(Json(updated))
+}
+
+async fn delete_app(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers)?;
+    if state.apps.remove(&id).is_none() {
+        return Err(ApiError::AppNotFound(id.clone()));
+    }
+    state.persist_apps()?;
+    tracing::info!(app = %id, "app removed");
     Ok(Json(json!({ "deleted": id })))
 }
 

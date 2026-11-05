@@ -41,6 +41,36 @@ pub enum ApiError {
     #[error("quota exhausted for protocol '{0}': all providers are at their rpm or tpm limit")]
     QuotaExhausted(String),
 
+    #[error("model not found: '{0}' is not declared by any provider; register it under a provider's models at /__admin/llm/providers")]
+    ModelNotFound(String),
+
+    #[error("no enabled provider serves model '{0}' for this protocol: declared providers are disabled or do not speak this protocol")]
+    NoProviderForModel(String),
+
+    #[error("model '{0}' is not allowed for app '{1}'")]
+    ModelNotAllowedForApp(String, String),
+
+    #[error("unauthorized: the presented credential does not match any app key")]
+    UnknownAppKey,
+
+    #[error("app '{0}' is disabled")]
+    AppDisabled(String),
+
+    #[error("invalid app: {0}")]
+    InvalidApp(String),
+
+    #[error("app id already exists: {0}")]
+    DuplicateAppId(String),
+
+    #[error("app key already exists (for app '{0}')")]
+    DuplicateAppKey(String),
+
+    #[error("app not found: {0}")]
+    AppNotFound(String),
+
+    #[error("request body too large: the LLM gateway buffers bodies up to 16 MiB to inspect the model field")]
+    RequestBodyTooLarge,
+
     #[error("bot not found: {0}")]
     BotNotFound(String),
 
@@ -64,7 +94,8 @@ pub enum ApiError {
 }
 
 impl ApiError {
-    fn status(&self) -> StatusCode {
+    /// 该错误的 house 状态码（`IntoResponse` 与转发路径共用，避免两处各写一张表）。
+    pub fn status(&self) -> StatusCode {
         match self {
             ApiError::RouteNotFound(_) => StatusCode::NOT_FOUND,
             ApiError::InvalidRoute(_) | ApiError::DuplicateId(_) | ApiError::DuplicatePrefix(_) => {
@@ -80,6 +111,16 @@ impl ApiError {
             }
             ApiError::NoProviderForProtocol(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::QuotaExhausted(_) => StatusCode::TOO_MANY_REQUESTS,
+            ApiError::ModelNotFound(_) => StatusCode::NOT_FOUND,
+            ApiError::NoProviderForModel(_) => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::ModelNotAllowedForApp(_, _) => StatusCode::FORBIDDEN,
+            ApiError::UnknownAppKey => StatusCode::UNAUTHORIZED,
+            ApiError::AppDisabled(_) => StatusCode::FORBIDDEN,
+            ApiError::InvalidApp(_)
+            | ApiError::DuplicateAppId(_)
+            | ApiError::DuplicateAppKey(_) => StatusCode::BAD_REQUEST,
+            ApiError::AppNotFound(_) => StatusCode::NOT_FOUND,
+            ApiError::RequestBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             ApiError::BotNotFound(_) => StatusCode::NOT_FOUND,
             ApiError::InvalidBot(_)
             | ApiError::DuplicateBotId(_)

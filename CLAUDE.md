@@ -46,11 +46,12 @@ Admin API (`src/admin.rs`): `Router` under `/__admin`. The prefix is deliberatel
 `qqbot-api-gateway`).
 
 Persistence (`src/config.rs`): every admin mutation calls `AppState::persist`
-(route changes), `persist_providers` (provider changes) or `persist_bots` (bot
-changes), which serializes the whole table to TOML and replaces the file atomically
-(temp file in the same directory + `persist`). **Rewrites drop comments** — the
-managed header line is the only comment that survives. A missing routes,
-providers or bots file at startup is not fatal: the gateway starts with none.
+(route changes), `persist_providers` (provider changes), `persist_apps` (app
+changes) or `persist_bots` (bot changes), which serializes the whole table to
+TOML and replaces the file atomically (temp file in the same directory +
+`persist`). **Rewrites drop comments** — the managed header line is the only
+comment that survives. A missing routes, providers, apps or bots file at startup
+is not fatal: the gateway starts with none.
 
 Health (`src/health.rs`): background task probes `upstream + health_path` every
 `GATEWAY_HEALTH_INTERVAL_SECS`; the first sweep runs immediately after boot rather
@@ -72,16 +73,34 @@ protocol from the endpoint name via a closed table (`chat/completions`... ->
 openai, `messages`/`complete` -> anthropic; `models`/`files` are ambiguous and
 404 with a hint to use the explicit form) and `/llm/{protocol}/...` is the
 unambiguous explicit form (openai/anthropic/systemone). In both cases the request
-is forwarded **as-is** (no cross-protocol translation; the v1 inference only
-decides the provider pool and credential injection) with per-protocol credentials
-(Bearer for openai/systemone, `x-api-key` + default `anthropic-version` for
-anthropic; client credentials are always replaced). A provider declares
-`protocols: Vec<Protocol>` and appears in every pool it declares, but quota is
-counted once per **provider** (all its models and protocols combined). Selection
-is weighted by remaining quota — `weight = min(rpm_ratio, tpm_ratio)` over a 60 s
-rolling window; all providers exhausted -> 429, none enabled -> 503. Selection
-and RPM accounting happen in one critical section with all trackers locked in
-table order (no awaits while held), so concurrent requests cannot over-select.
+is forwarded with no cross-protocol translation (the v1 inference only decides
+the provider pool and credential injection); the request body is **buffered**
+(up to 16 MiB, `MAX_REQUEST_BODY`) so the `model` field can be read, and it is
+re-serialized only when the selected provider's `upstream` name differs —
+otherwise the original bytes pass through byte-identical. A provider declares
+`protocols: Vec<Protocol>` and appears in every pool it declares, plus a
+`models` table mapping gateway-side names to upstream names with a `priority`
+per entry; an empty table is a protocol-level catchall (serves any model, no
+rewrite, effective priority `i32::MIN`, ADR-L14). Quota is counted once per
+**provider** (all its models and protocols combined). Selection is per
+`protocol + model`: candidates are tiered by the declaring entry's effective
+priority in descending order, the highest tier with any `weight > 0` member
+wins, and within a tier selection is weighted by remaining quota —
+`weight = min(rpm_ratio, tpm_ratio)` over a 60 s rolling window; every tier
+exhausted -> 429, no declaring provider -> 404, declared but pool empty
+(disabled / wrong protocol) -> 503, none enabled for the protocol (model-less
+requests) -> 503. Selection and RPM accounting happen in one critical section
+with all trackers locked in table order (no awaits while held), so concurrent
+requests cannot over-select. Inbound client credentials (`Authorization: Bearer`
+or `x-api-key`) identify an **app** (`apps.toml`, `AppTable`, constant-time key
+compare): no credential = default policy (all mapped models, allowed); a
+credential matching no app = 401 fail-closed; a disabled app = 403; a model
+outside the app's `models` combo = 403. Combo checks only cover requests whose
+body carries a `model` field — no model / non-JSON / oversized (413) requests
+are not blocked (known blind spot, `docs/sdd/llm/risks.md`). Provider credentials
+are injected per protocol (Bearer for openai/systemone, `x-api-key` + default
+`anthropic-version` for anthropic) and always replace client credentials.
+Per-provider `timeout_secs` overrides `GATEWAY_DEFAULT_TIMEOUT_SECS` (ADR-L17).
 TPM is counted *after the fact* from the response tail: a `UsageTap` stream
 copies chunks into a 64 KiB `TailBuffer` while streaming them to the client and
 extracts `usage` exactly once on stream end / upstream error / consumer drop;
@@ -121,18 +140,23 @@ return 503 on forwarding but **404** on the callback path (ADR-Q8).
   (`src/error.rs`), which maps each variant to a status code.
 - The TOML routes file and the admin API share one `Route` struct; anything
   settable in the file is settable through the API and vice versa. Same for
-  `Provider` / `providers.toml` / `/__admin/llm/providers` and `Bot` /
-  `bots.toml` / `/__admin/qqbot/bots`.
+  `Provider` / `providers.toml` / `/__admin/llm/providers`, `App` / `apps.toml` /
+  `/__admin/llm/apps` and `Bot` / `bots.toml` / `/__admin/qqbot/bots`.
 - `PUT /__admin/routes/{id}` is **merge** semantics: absent fields keep the
   current value. `id` is never patchable. Same for `PUT /__admin/llm/providers/{id}`,
   where `rpm_limit`/`tpm_limit` are `Option<Option<u64>>` — absent keeps the value,
   explicit `null` sets unlimited (the `deserialize_some` recipe in
   `src/llm/provider.rs` is what separates them; serde's default does not) and
   `protocols` replaces the whole list when given. Same
+  for `PUT /__admin/llm/apps/{id}` (`models` is `Option<Vec<String>>`: absent or
+  `null` keeps, a list replaces, `[]` = unrestricted) and
   for `PUT /__admin/qqbot/bots/{id}`, where `api_base`/`ws_url`/`event_url`/
   `event_secret` are `Option<Option<String>>` — absent keeps the value, explicit
   `null` clears the override. Bot mutations also drive the WS supervisor lifecycle
   (`bot_ws.ensure` / `stop`) after persisting.
 - Missing required fields in a JSON body return **422** (axum `Json` extractor
   rejection, same for routes, providers and bots); 400 is reserved for `validate()`
-  rule failures and duplicate ids.
+  rule failures and duplicate ids. `AppInput` has no required fields (an empty
+  body `{}` creates an app with generated id/key), so apps never 422 — malformed
+  JSON is a 400 and an explicit empty/whitespace `id`/`key` is a 400 from
+  `validate()`.

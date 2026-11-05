@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 use top_gateway::build_app;
 use top_gateway::config::{self, Settings};
-use top_gateway::llm::provider::{Protocol, Provider};
+use top_gateway::llm::provider::{Model, Protocol, Provider};
 use top_gateway::state::AppState;
 
 const ADMIN_KEY: &str = "test-admin-key";
@@ -28,6 +28,7 @@ struct LlmGateway {
     addr: SocketAddr,
     _dir: TempDir,
     providers_path: PathBuf,
+    apps_path: PathBuf,
 }
 
 fn provider(id: &str, protocol: Protocol, base_url: &str) -> Provider {
@@ -39,6 +40,8 @@ fn provider(id: &str, protocol: Protocol, base_url: &str) -> Provider {
         api_key: format!("key-{id}"),
         rpm_limit: None,
         tpm_limit: None,
+        models: vec![],
+        timeout_secs: None,
         enabled: true,
     }
 }
@@ -53,17 +56,20 @@ fn multi_protocol_provider(id: &str, base_url: &str) -> Provider {
         api_key: format!("key-{id}"),
         rpm_limit: None,
         tpm_limit: None,
+        models: vec![],
+        timeout_secs: None,
         enabled: true,
     }
 }
 
-fn llm_settings(routes_path: PathBuf, providers_path: PathBuf) -> Settings {
+fn llm_settings(routes_path: PathBuf, providers_path: PathBuf, apps_path: PathBuf) -> Settings {
     Settings {
         bind: "127.0.0.1:0".to_string(),
         admin_key: Some(ADMIN_KEY.to_string()),
         routes_file: routes_path,
         providers_file: providers_path,
         bots_file: std::path::PathBuf::from("bots.toml"),
+        apps_file: apps_path,
         health_interval_secs: 600,
         health_timeout_secs: 2,
         default_timeout_secs: 15,
@@ -74,9 +80,10 @@ async fn spawn_llm_gateway(providers: Vec<Provider>) -> LlmGateway {
     let dir = tempfile::tempdir().unwrap();
     let routes_path = dir.path().join("routes.toml");
     let providers_path = dir.path().join("providers.toml");
+    let apps_path = dir.path().join("apps.toml");
     config::save_routes(&routes_path, &[]).unwrap();
     config::save_providers(&providers_path, &providers).unwrap();
-    let settings = llm_settings(routes_path, providers_path.clone());
+    let settings = llm_settings(routes_path, providers_path.clone(), apps_path.clone());
     let state = AppState::new(settings).unwrap();
     state
         .routes
@@ -94,6 +101,7 @@ async fn spawn_llm_gateway(providers: Vec<Provider>) -> LlmGateway {
         addr,
         _dir: dir,
         providers_path,
+        apps_path,
     }
 }
 
@@ -249,7 +257,6 @@ async fn llm_forwards_openai_path_and_bearer_key() {
     let body = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]});
     let resp = authed()
         .post(gateway_url(&gw, "/llm/openai/v1/chat/completions"))
-        .header("authorization", "Bearer client-key")
         .json(&body)
         .send()
         .await
@@ -346,7 +353,6 @@ async fn llm_v1_inference_routes_by_endpoint() {
     // chat/completions → openai 池：Bearer 注入、路径以 /v1 开头
     let resp = authed()
         .post(gateway_url(&gw, "/llm/v1/chat/completions"))
-        .header("authorization", "Bearer client-key")
         .json(&json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}))
         .send()
         .await
@@ -1086,6 +1092,7 @@ async fn llm_coexists_with_route_table() {
     let dir = tempfile::tempdir().unwrap();
     let routes_path = dir.path().join("routes.toml");
     let providers_path = dir.path().join("providers.toml");
+    let apps_path = dir.path().join("apps.toml");
     config::save_providers(
         &providers_path,
         &[provider("openai-official", Protocol::Openai, &upstream)],
@@ -1106,7 +1113,7 @@ async fn llm_coexists_with_route_table() {
         }],
     )
     .unwrap();
-    let settings = llm_settings(routes_path, providers_path.clone());
+    let settings = llm_settings(routes_path, providers_path.clone(), apps_path.clone());
     let state = AppState::new(settings).unwrap();
     state
         .routes
@@ -1124,6 +1131,7 @@ async fn llm_coexists_with_route_table() {
         addr,
         _dir: dir,
         providers_path,
+        apps_path,
     };
 
     // routes.toml 的前缀转发照常
@@ -1178,4 +1186,851 @@ fn portpicker_forbidden() -> u16 {
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     port
+}
+
+// ---------------------------------------------------- 模型映射 / 应用组合新增件
+
+/// 声明模型表的供应商：`models` 至少一条。
+fn provider_with_models(
+    id: &str,
+    protocol: Protocol,
+    base_url: &str,
+    models: Vec<Model>,
+) -> Provider {
+    let mut p = provider(id, protocol, base_url);
+    p.models = models;
+    p
+}
+
+fn model(name: &str, upstream: Option<&str>, priority: i32) -> Model {
+    Model {
+        name: name.to_string(),
+        upstream: upstream.map(str::to_string),
+        priority,
+    }
+}
+
+/// 逐字节回显请求 body 的 mock 上游（断言 model 改写 / 零差异透传）。
+async fn spawn_body_echo() -> String {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|body: Bytes| async move { ([("content-type", "application/json")], body) }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+/// 睡 `secs` 秒再回 200 的 mock 上游（断言按供应商超时）。
+async fn spawn_slow_llm(secs: u64) -> String {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || async move {
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            Json(json!({"id": "chatcmpl-slow"}))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+/// 通过管理 API 注册一个 app，返回创建后的 app JSON（含生成的 key）。
+async fn create_app(gw: &LlmGateway, body: &Value) -> Value {
+    let resp = reqwest::Client::new()
+        .post(gateway_url(gw, "/__admin/llm/apps"))
+        .header("X-Admin-Key", ADMIN_KEY)
+        .json(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    resp.json().await.unwrap()
+}
+
+async fn update_app(gw: &LlmGateway, id: &str, body: &Value) -> Value {
+    reqwest::Client::new()
+        .put(gateway_url(gw, &format!("/__admin/llm/apps/{id}")))
+        .header("X-Admin-Key", ADMIN_KEY)
+        .json(body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+async fn app_list(gw: &LlmGateway) -> Vec<Value> {
+    admin_get(gw, "/__admin/llm/apps")
+        .await
+        .json::<Value>()
+        .await
+        .unwrap()["apps"]
+        .as_array()
+        .cloned()
+        .unwrap()
+}
+
+fn chat_request(model: &str) -> Value {
+    json!({"model": model, "messages": [{"role": "user", "content": "hi"}]})
+}
+
+/// 向网关发一次 chat/completions，返回 (状态码, 响应 JSON 或 house 错误体)。
+async fn post_chat(gw: &LlmGateway, path: &str, body: &Value) -> (u16, Value) {
+    let resp = authed()
+        .post(gateway_url(gw, path))
+        .json(body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let v: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+    (status, v)
+}
+
+async fn post_chat_with_key(gw: &LlmGateway, path: &str, body: &Value, key: &str) -> (u16, Value) {
+    let resp = authed()
+        .post(gateway_url(gw, path))
+        .header("authorization", format!("Bearer {key}"))
+        .json(body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let v: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+    (status, v)
+}
+
+// ------------------------------------------- ADR-L14/L16 模型映射与分层选择
+
+/// ADR-L14：两供应商声明同一网关 model、不同 upstream 名与 priority，
+/// 高优先级者被选中，且上游 body 的 model 被改写为该供应商的 upstream 名。
+#[tokio::test]
+async fn llm_rewrites_model_to_upstream_name() {
+    let upstream = spawn_body_echo().await;
+    let gw = spawn_llm_gateway(vec![
+        provider_with_models(
+            "preferred",
+            Protocol::Openai,
+            &upstream,
+            vec![model("gpt-4o", Some("gpt-4o-2024-08-06"), 10)],
+        ),
+        provider_with_models(
+            "fallback",
+            Protocol::Openai,
+            &upstream,
+            vec![model("gpt-4o", Some("gpt-4o-mini-2024"), 1)],
+        ),
+    ])
+    .await;
+
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/openai/v1/chat/completions"))
+        .json(&chat_request("gpt-4o"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-llm-provider"], "preferred");
+    let echoed: Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(echoed["model"], "gpt-4o-2024-08-06");
+}
+
+/// ADR-L14：upstream 名与请求 model 相同时不重序列化——上游收到的 body
+/// 与客户端发送的逐字节一致（键序保持原样，证明没有经过 Value 往返）。
+#[tokio::test]
+async fn llm_model_rewrite_zero_diff_passthrough() {
+    let upstream = spawn_body_echo().await;
+    let gw = spawn_llm_gateway(vec![provider_with_models(
+        "openai-official",
+        Protocol::Openai,
+        &upstream,
+        vec![model("gpt-4o", None, 0)],
+    )])
+    .await;
+
+    // 手工构造键序非字典序的 body：经 Value 重序列化后键会被排序，逐字节比较即可分辨
+    let raw = br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/openai/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(&raw[..])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap(), &raw[..]);
+}
+
+/// ADR-L16：高优先级供应商 `rpm_limit = 1` 耗尽后，下一次请求降层到低优先级供应商。
+#[tokio::test]
+async fn llm_priority_tier_demotes_on_exhaustion() {
+    let upstream = spawn_mock_llm().await;
+    let mut top = provider_with_models(
+        "top",
+        Protocol::Openai,
+        &upstream,
+        vec![model("gpt-4o", None, 10)],
+    );
+    top.rpm_limit = Some(1);
+    let low = provider_with_models(
+        "low",
+        Protocol::Openai,
+        &upstream,
+        vec![model("gpt-4o", None, 1)],
+    );
+    let gw = spawn_llm_gateway(vec![top, low]).await;
+
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/openai/v1/chat/completions"))
+        .json(&chat_request("gpt-4o"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-llm-provider"], "top");
+
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/openai/v1/chat/completions"))
+        .json(&chat_request("gpt-4o"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-llm-provider"], "low");
+}
+
+/// 无任何供应商声明该 model → 404，消息提示模型表位置。
+/// 注意：空模型表的兜底供应商参与任意 model 请求（ADR-L14），所以本用例
+/// 的供应商都带非空模型表——否则未知模型会被兜底接走。
+#[tokio::test]
+async fn llm_unknown_model_returns_404() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![
+        provider_with_models(
+            "a",
+            Protocol::Openai,
+            &upstream,
+            vec![model("gpt-4o", None, 0)],
+        ),
+        provider_with_models(
+            "b",
+            Protocol::Openai,
+            &upstream,
+            vec![model("gpt-4o-mini", None, 0)],
+        ),
+    ])
+    .await;
+
+    let (status, err) = post_chat(
+        &gw,
+        "/llm/openai/v1/chat/completions",
+        &chat_request("nope-2x"),
+    )
+    .await;
+    assert_eq!(status, 404);
+    let msg = err["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("nope-2x"),
+        "message should name the model: {msg}"
+    );
+    assert!(
+        msg.contains("/__admin/llm/providers"),
+        "message should hint where models are declared: {msg}"
+    );
+}
+
+/// 模型有声明但池空（供应商 disabled）→ 503，不是 404 或 500。
+#[tokio::test]
+async fn llm_model_all_disabled_returns_503() {
+    let upstream = spawn_mock_llm().await;
+    let mut disabled = provider_with_models(
+        "off",
+        Protocol::Openai,
+        &upstream,
+        vec![model("gpt-4o", None, 0)],
+    );
+    disabled.enabled = false;
+    let gw = spawn_llm_gateway(vec![disabled]).await;
+
+    let (status, err) = post_chat(
+        &gw,
+        "/llm/openai/v1/chat/completions",
+        &chat_request("gpt-4o"),
+    )
+    .await;
+    assert_eq!(status, 503);
+    assert!(err["error"]["message"].as_str().unwrap().contains("gpt-4o"));
+}
+
+/// 所有层 weight 全 0（rpm 耗尽）→ 429，house 错误体含 model。
+#[tokio::test]
+async fn llm_all_tiers_exhausted_returns_429() {
+    let upstream = spawn_mock_llm().await;
+    let mut only = provider_with_models(
+        "only",
+        Protocol::Openai,
+        &upstream,
+        vec![model("gpt-4o", None, 0)],
+    );
+    only.rpm_limit = Some(1);
+    let gw = spawn_llm_gateway(vec![only]).await;
+
+    let (status, _) = post_chat(
+        &gw,
+        "/llm/openai/v1/chat/completions",
+        &chat_request("gpt-4o"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, err) = post_chat(
+        &gw,
+        "/llm/openai/v1/chat/completions",
+        &chat_request("gpt-4o"),
+    )
+    .await;
+    assert_eq!(status, 429);
+    assert!(err["error"]["message"].as_str().unwrap().contains("gpt-4o"));
+}
+
+/// ADR-L14：显式声明该 model 的供应商优先于空模型表的兜底供应商。
+#[tokio::test]
+async fn llm_model_request_skips_empty_models_provider() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![
+        provider("legacy-catchall", Protocol::Openai, &upstream),
+        provider_with_models(
+            "declared",
+            Protocol::Openai,
+            &upstream,
+            vec![model("gpt-4o", None, 0)],
+        ),
+    ])
+    .await;
+
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/openai/v1/chat/completions"))
+        .json(&chat_request("gpt-4o"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-llm-provider"], "declared");
+}
+
+/// ADR-L14 空表兜底：只有无模型表的供应商时，带 model 的请求照常路由、
+/// model 原样透传（不改写）。
+#[tokio::test]
+async fn llm_catchall_provider_passes_model_through() {
+    let upstream = spawn_body_echo().await;
+    let gw = spawn_llm_gateway(vec![provider("legacy", Protocol::Openai, &upstream)]).await;
+
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/openai/v1/chat/completions"))
+        .json(&chat_request("gpt-4o"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-llm-provider"], "legacy");
+    let echoed: Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(echoed["model"], "gpt-4o");
+}
+
+/// ADR-L14 兜底兼容：历史无模型表 provider 配置在带 model 的请求下仍可路由。
+#[tokio::test]
+async fn llm_legacy_provider_without_models_still_works() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![provider(
+        "openai-official",
+        Protocol::Openai,
+        &upstream,
+    )])
+    .await;
+
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/v1/chat/completions"))
+        .json(&chat_request("gpt-4o"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-llm-provider"], "openai-official");
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["path"], "/v1/chat/completions");
+}
+
+// ------------------------------------------------------- ADR-L15 应用组合
+
+/// ADR-L15 默认策略：无凭证请求按全部已映射模型放行（历史 `Bearer client-key`
+/// 站点去头后的回归基线）。
+#[tokio::test]
+async fn llm_request_without_credential_uses_default_policy() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![provider_with_models(
+        "openai-official",
+        Protocol::Openai,
+        &upstream,
+        vec![model("gpt-4o", None, 0)],
+    )])
+    .await;
+
+    let (status, _) = post_chat(
+        &gw,
+        "/llm/openai/v1/chat/completions",
+        &chat_request("gpt-4o"),
+    )
+    .await;
+    assert_eq!(status, 200);
+}
+
+/// 组合校验盲区（R11）：app 组合非空但请求 body 无 `model` 字段 → 放行，不拦截。
+#[tokio::test]
+async fn llm_app_combo_allows_models_without_model_field() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![provider(
+        "openai-official",
+        Protocol::Openai,
+        &upstream,
+    )])
+    .await;
+    let app = create_app(
+        &gw,
+        &json!({"id": "cli", "key": "sk-gw-cli-test", "models": ["gpt-4o"]}),
+    )
+    .await;
+    assert_eq!(app["models"][0], "gpt-4o");
+
+    let (status, v) = post_chat_with_key(
+        &gw,
+        "/llm/openai/v1/chat/completions",
+        &json!({"messages": []}),
+        "sk-gw-cli-test",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(v["path"], "/v1/chat/completions");
+}
+
+/// 组合外 model → 403，消息含 model 与 app id。
+#[tokio::test]
+async fn llm_app_rejects_model_outside_combo() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![provider(
+        "openai-official",
+        Protocol::Openai,
+        &upstream,
+    )])
+    .await;
+    create_app(
+        &gw,
+        &json!({"id": "cli", "key": "sk-gw-cli-test", "models": ["gpt-4o"]}),
+    )
+    .await;
+
+    let (status, err) = post_chat_with_key(
+        &gw,
+        "/llm/openai/v1/chat/completions",
+        &chat_request("gpt-3.5-turbo"),
+        "sk-gw-cli-test",
+    )
+    .await;
+    assert_eq!(status, 403);
+    let msg = err["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("gpt-3.5-turbo"),
+        "message should name the model: {msg}"
+    );
+    assert!(msg.contains("cli"), "message should name the app id: {msg}");
+}
+
+/// 凭证存在但不命中任何 app → 401（fail-closed）；去掉凭证后同一请求放行。
+#[tokio::test]
+async fn llm_unknown_app_key_returns_401() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![provider(
+        "openai-official",
+        Protocol::Openai,
+        &upstream,
+    )])
+    .await;
+
+    let (status, err) = post_chat_with_key(
+        &gw,
+        "/llm/openai/v1/chat/completions",
+        &chat_request("gpt-4o"),
+        "sk-gw-made-up",
+    )
+    .await;
+    assert_eq!(status, 401);
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("app key"));
+
+    // 去掉凭证 → 默认策略放行
+    let (status, _) = post_chat(
+        &gw,
+        "/llm/openai/v1/chat/completions",
+        &chat_request("gpt-4o"),
+    )
+    .await;
+    assert_eq!(status, 200);
+}
+
+/// 命中但 `enabled = false` 的 app key → 403。
+#[tokio::test]
+async fn llm_disabled_app_key_returns_403() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![provider(
+        "openai-official",
+        Protocol::Openai,
+        &upstream,
+    )])
+    .await;
+    create_app(&gw, &json!({"id": "cli", "key": "sk-gw-cli-test"})).await;
+    update_app(&gw, "cli", &json!({"enabled": false})).await;
+
+    let (status, err) = post_chat_with_key(
+        &gw,
+        "/llm/openai/v1/chat/completions",
+        &chat_request("gpt-4o"),
+        "sk-gw-cli-test",
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("disabled"));
+}
+
+// ------------------------------------------- ADR-L14 缓冲上限与 ADR-L17 超时
+
+/// 超过 16 MiB 的请求 body → 413，不转发（R12）。
+#[tokio::test]
+async fn llm_oversized_body_returns_413() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![provider(
+        "openai-official",
+        Protocol::Openai,
+        &upstream,
+    )])
+    .await;
+
+    let too_big = " ".repeat(16 * 1024 * 1024 + 1);
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/openai/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(too_big)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 413);
+}
+
+/// ADR-L17：provider `timeout_secs = 1` 指向 sleep 3s 的慢上游 → 504；
+/// 不设 timeout 的 provider 走全局默认（15s），同一慢上游正常 200。
+#[tokio::test]
+async fn llm_provider_timeout_overrides_global() {
+    let slow = spawn_slow_llm(3).await;
+    let mut quick = provider("quick", Protocol::Openai, &slow);
+    quick.timeout_secs = Some(1);
+    let gw = spawn_llm_gateway(vec![quick]).await;
+
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/openai/v1/chat/completions"))
+        .json(&chat_request("gpt-4o"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 504);
+
+    // 不设 timeout → 全局默认 15s，3s 上游来得及响应
+    let gw = spawn_llm_gateway(vec![provider("default", Protocol::Openai, &slow)]).await;
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/openai/v1/chat/completions"))
+        .json(&chat_request("gpt-4o"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+// --------------------------------------------------- ADR-L18 apps 管理面
+
+/// apps CRUD、合并式 PUT（models 列表替换）、key 自动生成 `sk-gw-...`、
+/// `apps.toml` 原子写回。
+#[tokio::test]
+async fn llm_admin_app_crud_and_persistence() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![provider(
+        "openai-official",
+        Protocol::Openai,
+        &upstream,
+    )])
+    .await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}/__admin/llm/apps", gw.addr);
+
+    // 空表起步
+    assert!(app_list(&gw).await.is_empty());
+
+    // `{}` 也能创建：启用、空组合、自动生成 id 与 sk-gw- key
+    let generated = create_app(&gw, &json!({})).await;
+    assert_eq!(generated["enabled"], true);
+    assert_eq!(generated["models"].as_array().unwrap().len(), 0);
+    let gen_key = generated["key"].as_str().unwrap();
+    assert!(
+        gen_key.starts_with("sk-gw-") && gen_key.len() > "sk-gw-".len() + 8,
+        "generated key should look like sk-gw-<uuid>: {gen_key}"
+    );
+    let generated_id = generated["id"].as_str().unwrap().to_string();
+
+    // 显式指定 id / key / models
+    let created = create_app(
+        &gw,
+        &json!({"id": "cli-code", "name": "Claude Code CLI", "key": "sk-gw-cli", "models": ["chat-pro", "chat-max"]}),
+    )
+    .await;
+    assert_eq!(created["id"], "cli-code");
+    assert_eq!(created["name"], "Claude Code CLI");
+
+    // 重复 id / 重复 key → 400
+    for body in [
+        json!({"id": "cli-code", "key": "other"}),
+        json!({"id": "other", "key": "sk-gw-cli"}),
+    ] {
+        assert_eq!(
+            client
+                .post(&base)
+                .header("X-Admin-Key", ADMIN_KEY)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+    }
+    // 非法（显式空 id，区别于省略）→ 400
+    assert_eq!(
+        client
+            .post(&base)
+            .header("X-Admin-Key", ADMIN_KEY)
+            .json(&json!({"id": "", "key": "k"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    // 空白 key 同样非法；纯空白 model 名不卡（组合语义里无意义）
+    assert_eq!(
+        client
+            .post(&base)
+            .header("X-Admin-Key", ADMIN_KEY)
+            .json(&json!({"id": "x", "key": "   "}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    // JSON 体不合法 → 400（axum JsonRejection；app 无必填字段，422 不可达）
+    assert_eq!(
+        client
+            .post(&base)
+            .header("X-Admin-Key", ADMIN_KEY)
+            .header("content-type", "application/json")
+            .body("not json")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+
+    // GET 单个；未知 → 404
+    let one: Value = client
+        .get(format!("{base}/cli-code"))
+        .header("X-Admin-Key", ADMIN_KEY)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(one["id"], "cli-code");
+    assert_eq!(
+        client
+            .get(format!("{base}/ghost"))
+            .header("X-Admin-Key", ADMIN_KEY)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+
+    // PUT 合并：未给字段保留；models 给列表 = 整体替换；key 不可改
+    let updated = update_app(
+        &gw,
+        "cli-code",
+        &json!({"models": ["chat-mini"], "enabled": false}),
+    )
+    .await;
+    assert_eq!(updated["name"], "Claude Code CLI"); // 未给 → 保留
+    assert_eq!(updated["enabled"], false);
+    assert_eq!(updated["models"].as_array().unwrap().len(), 1);
+    assert_eq!(updated["models"][0], "chat-mini");
+    assert_eq!(updated["key"], "sk-gw-cli");
+
+    // 落盘：重读 apps.toml 断言
+    let on_disk = std::fs::read_to_string(&gw.apps_path).unwrap();
+    assert!(on_disk.contains("id = \"cli-code\""));
+    assert!(on_disk.contains("chat-mini"));
+    assert!(on_disk.contains("sk-gw-cli"));
+    assert!(!on_disk.contains("chat-pro")); // 已被整体替换
+
+    // DELETE：未知 → 404；成功 → 200 且持久化后消失
+    assert_eq!(
+        client
+            .delete(format!("{base}/ghost"))
+            .header("X-Admin-Key", ADMIN_KEY)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    let deleted: Value = client
+        .delete(format!("{base}/cli-code"))
+        .header("X-Admin-Key", ADMIN_KEY)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(deleted["deleted"], "cli-code");
+    let on_disk = std::fs::read_to_string(&gw.apps_path).unwrap();
+    assert!(!on_disk.contains("cli-code"));
+
+    // 只剩自动生成的那个 app
+    let remaining: Vec<String> = app_list(&gw)
+        .await
+        .iter()
+        .map(|a| a["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(remaining, vec![generated_id]);
+}
+
+// ---------------------------------------------------------------- examples
+
+/// `examples/` 下的示例 TOML 必须能被真实加载器解析并通过 `validate`，且示例
+/// 演示的分层 / 超时 / 组合不变式成立——这是示例文档不腐坏的机械保证（文档
+/// 侧质量门，无对应 SDD 契约；`mapping.md` 标为 examples 维护条目）。
+#[test]
+fn llm_example_configs_parse_and_validate() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let providers_path = root.join("examples").join("providers.example.toml");
+    let apps_path = root.join("examples").join("apps.example.toml");
+    assert!(
+        providers_path.exists(),
+        "missing {}",
+        providers_path.display()
+    );
+    assert!(apps_path.exists(), "missing {}", apps_path.display());
+
+    let providers = config::load_providers(&providers_path)
+        .unwrap_or_else(|e| panic!("parse {}: {e}", providers_path.display()));
+    let apps = config::load_apps(&apps_path)
+        .unwrap_or_else(|e| panic!("parse {}: {e}", apps_path.display()));
+
+    assert_eq!(providers.len(), 3, "示例应含 3 个供应商");
+    for provider in &providers {
+        provider
+            .validate()
+            .unwrap_or_else(|e| panic!("provider '{}' 无效: {e}", provider.id));
+    }
+    assert_eq!(apps.len(), 3, "示例应含 3 个 app");
+    for app in &apps {
+        app.validate()
+            .unwrap_or_else(|e| panic!("app '{}' 无效: {e}", app.id));
+    }
+    // id / key 全表唯一（load_* 只告警不拒绝，示例必须自己干净）
+    let ids: HashSet<_> = apps.iter().map(|a| a.id.clone()).collect();
+    let keys: HashSet<_> = apps.iter().map(|a| a.key.clone()).collect();
+    assert_eq!(ids.len(), apps.len());
+    assert_eq!(keys.len(), apps.len());
+
+    // 示例演示的分层（ADR-L16）：同一网关模型被两家声明，优先级 10 与 1
+    let priorities = providers
+        .iter()
+        .flat_map(|p| {
+            p.models
+                .iter()
+                .filter(|m| m.name == "chat-pro")
+                .map(move |m| (p.id.clone(), m.priority))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        priorities,
+        vec![
+            ("shared-primary".to_string(), 10),
+            ("shared-fallback".to_string(), 1),
+        ]
+    );
+    // 示例演示的按供应商超时（ADR-L17）与协议级改写（upstream 与 name 不同）
+    let open_models = providers
+        .iter()
+        .find(|p| p.id == "open-models")
+        .expect("示例应含 open-models 供应商");
+    assert_eq!(open_models.timeout_secs, Some(60));
+    // 共享上游两条故意不写 timeout_secs：与 open-models 的显式覆盖成对演示
+    // 「缺省继承全局默认」（ADR-L17）
+    for provider in &providers {
+        if provider.id.starts_with("shared-") {
+            assert!(
+                provider.timeout_secs.is_none(),
+                "provider '{}' 应演示缺省继承超时",
+                provider.id
+            );
+        }
+    }
+    assert_eq!(open_models.models.len(), 3);
+    assert!(open_models
+        .models
+        .iter()
+        .all(|m| m.upstream != Some(m.name.clone())));
+
+    // 示例里 app 组合必须全部指向有供应商声明的网关模型（否则组合内模型 404）
+    let declared: HashSet<_> = providers
+        .iter()
+        .flat_map(|p| p.models.iter().map(|m| m.name.clone()))
+        .collect();
+    for app in &apps {
+        for model in &app.models {
+            assert!(
+                declared.contains(model),
+                "app '{}' 组合引用了未被任何供应商声明的模型 '{model}'",
+                app.id
+            );
+        }
+    }
+    // 示例必须覆盖三种组合形态：限定 / 混搭 / 空表不限制
+    let combos: Vec<&[String]> = apps.iter().map(|a| a.models.as_slice()).collect();
+    assert!(combos.iter().any(|m| m.is_empty()), "缺「空表不限制」示例");
+    assert!(
+        combos.iter().any(|m| m.len() >= 2),
+        "缺「多模型限定组合」示例"
+    );
 }
