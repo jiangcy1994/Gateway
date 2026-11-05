@@ -1017,6 +1017,25 @@ async fn llm_admin_provider_proxy_merge_semantics() {
         .unwrap();
     assert_eq!(cleared["proxy_url"], serde_json::Value::Null);
 
+    // GET（单项与列表）的供应商 JSON 总是带 proxy_url 键，未配置即 null——
+    // 对 0.2.2 之前的消费者是纯新增键（与 rpm_limit/tpm_limit/timeout_secs 同构）
+    let got: Value = client
+        .get(format!("{base}/__admin/llm/providers/proxied"))
+        .header("X-Admin-Key", ADMIN_KEY)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(got["proxy_url"], serde_json::Value::Null);
+    let listed: Value = admin_get(&gw, "/__admin/llm/providers")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["providers"][0]["proxy_url"], serde_json::Value::Null);
+
     let resp = authed()
         .post(gateway_url(&gw, "/llm/openai/v1/chat/completions"))
         .json(&json!({"model": "chat-pro", "messages": []}))
@@ -1030,6 +1049,193 @@ async fn llm_admin_provider_proxy_merge_semantics() {
     // 重载等价：ConfigLoad 回到无代理形态
     let reloaded = config::load_providers(&gw.providers_path).unwrap();
     assert_eq!(reloaded[0].proxy_url, None);
+}
+
+/// 0.2.1 时期的生产形态 providers.toml（单值 `protocol`、空模型表的兜底
+/// 供应商、带模型表的禁用供应商、注释、无 `proxy_url` 键）在 0.2.2 下加载，
+/// 且重写后**不多出代理键**——未配代理的既有部署落盘形态与旧版一致，只有
+/// 已知的 `protocol` → `protocols` 迁移（ADR-L13/L14）。
+#[tokio::test]
+async fn llm_legacy_production_file_round_trips_without_proxy_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("providers.toml");
+    std::fs::write(
+        &path,
+        [
+            "# top-gateway providers - managed file, rewrites drop comments",
+            "[[providers]]",
+            "id = 'inkstone'",
+            "name = 'inkstone'",
+            "protocol = 'openai'",
+            "base_url = 'https://discovery-api.example.com'",
+            "api_key = 'sk-legacy'",
+            "models = []",
+            "",
+            "[[providers]]",
+            "id = 'nvidia'",
+            "name = 'nvidia'",
+            "protocols = ['openai']",
+            "base_url = 'https://integrate.example.com'",
+            "api_key = 'nvapi-legacy'",
+            "enabled = false",
+            "",
+            "  [[providers.models]]",
+            "  name = 'chat-pro'",
+            "  upstream = 'vendor/chat-pro'",
+            "  priority = 10",
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let loaded = config::load_providers(&path).unwrap();
+    assert_eq!(loaded.len(), 2);
+    // 空模型表 = 协议级兜底（ADR-L14）；单值 protocol 已按 ADR-L13 读入
+    assert!(loaded[0].models.is_empty());
+    assert_eq!(loaded[0].protocols, vec![Protocol::Openai]);
+    assert_eq!(loaded[0].proxy_url, None);
+    assert!(!loaded[1].enabled);
+    assert_eq!(loaded[1].models.len(), 1);
+    assert_eq!(loaded[1].models[0].priority, 10);
+    assert_eq!(loaded[1].proxy_url, None);
+
+    // 重写：无代理供应商不落 proxy_url 键（与未加该字段的旧版逐字节等价）
+    config::save_providers(&path, &loaded).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("proxy_url"));
+    assert!(!text.contains("protocol ="));
+    assert!(text.contains("protocols = ["));
+
+    let reloaded = config::load_providers(&path).unwrap();
+    assert!(reloaded[0].models.is_empty());
+    assert_eq!(reloaded[1].models.len(), 1);
+    assert_eq!(reloaded[0].proxy_url, None);
+    assert_eq!(reloaded[1].proxy_url, None);
+    assert!(!reloaded[1].enabled);
+}
+
+/// 文件态端到端（ADR-L19）：providers.toml 里直接写 `proxy_url` → 启动加载
+/// 后请求**实际走该代理**——钉住「磁盘配置 → 启动加载 → 转发」整条链路，
+/// 而非只有管理 API 一条配置路径。base_url 指向无人监听的端口，请求若能
+/// 抵达必是经代理；代理端读到 absolute-form URI。
+#[tokio::test]
+async fn llm_file_level_proxy_url_routes_request_through_proxy() {
+    let proxy = spawn_mock_proxy().await;
+    let port = portpicker_forbidden();
+    let dir = tempfile::tempdir().unwrap();
+    let providers_path = dir.path().join("providers.toml");
+    std::fs::write(
+        &providers_path,
+        [
+            "[[providers]]",
+            "id = 'via-file'",
+            "name = 'via-file'",
+            "protocols = ['openai']",
+            &format!("base_url = 'http://127.0.0.1:{port}'"),
+            "api_key = 'k'",
+            &format!("proxy_url = '{proxy}'"),
+            "enabled = true",
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    let routes_path = dir.path().join("routes.toml");
+    config::save_routes(&routes_path, &[]).unwrap();
+    let settings = llm_settings(
+        routes_path,
+        providers_path.clone(),
+        dir.path().join("apps.toml"),
+    );
+    let state = AppState::new(settings).unwrap();
+    state
+        .providers
+        .set_all(config::load_providers(providers_path.as_path()).unwrap());
+    let app = build_app(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let resp = authed()
+        .post(format!("http://{addr}/llm/openai/v1/chat/completions"))
+        .json(&json!({"model": "chat-pro", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-llm-provider"], "via-file");
+    let v: Value = resp.json().await.unwrap();
+    let request_uri = v["request_uri"].as_str().unwrap();
+    assert!(
+        request_uri.starts_with("http://127.0.0.1:"),
+        "代理端应读到 absolute-form URI，实际：{request_uri}"
+    );
+    assert!(request_uri.ends_with(&format!(":{port}/v1/chat/completions")));
+}
+
+/// 启动加载路径**不跑 `validate`**（与 base_url 同构，`load_providers` 后置）：
+/// 手工往 providers.toml 写非法 `proxy_url`（socks5）能加载、启动不失败，
+/// 但 `validate` 的 400 闸门只在管理 API 路径上；文件态的首个请求把
+/// socks5 代理当作传输错误暴露为 502「provider ... unreachable」，运维上
+/// 与「代理挂了」不可区分——钉住 R13/R14 这条边界。
+#[tokio::test]
+async fn llm_hand_edited_invalid_proxy_loads_but_fails_at_request_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let providers_path = dir.path().join("providers.toml");
+    let proxy_port = portpicker_forbidden();
+    let port = portpicker_forbidden();
+    std::fs::write(
+        &providers_path,
+        [
+            "[[providers]]",
+            "id = 'bad-proxy'",
+            "name = 'bad-proxy'",
+            "protocols = ['openai']",
+            &format!("base_url = 'http://127.0.0.1:{port}'"),
+            "api_key = 'k'",
+            &format!("proxy_url = 'socks5://127.0.0.1:{proxy_port}'"),
+            "enabled = true",
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    let routes_path = dir.path().join("routes.toml");
+    config::save_routes(&routes_path, &[]).unwrap();
+    let settings = llm_settings(
+        routes_path,
+        providers_path.clone(),
+        dir.path().join("apps.toml"),
+    );
+    let state = AppState::new(settings).unwrap();
+    // 启动加载接受 socks5 值（文件态优先于校验）
+    let loaded = config::load_providers(providers_path.as_path()).unwrap();
+    let expected = format!("socks5://127.0.0.1:{proxy_port}");
+    assert_eq!(loaded[0].proxy_url.as_deref(), Some(expected.as_str()));
+    state.providers.set_all(loaded);
+    let app = build_app(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let resp = authed()
+        .post(format!("http://{addr}/llm/openai/v1/chat/completions"))
+        .json(&json!({"model": "chat-pro", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    // 回环 connection refused 在本机约 2s；authed 客户端 30s 超时足够不误判
+    assert_eq!(resp.status(), 502);
+    let err = error_body(resp).await;
+    let msg = err["message"].as_str().unwrap();
+    assert!(
+        msg.contains("bad-proxy") && msg.contains("unreachable"),
+        "应归属到供应商的传输错误，实际：{msg}"
+    );
+    // 请求行里的目标 URL 是 base_url，而不是 socks5 代理 url
+    assert!(msg.contains(&format!("127.0.0.1:{port}")));
 }
 
 #[tokio::test]

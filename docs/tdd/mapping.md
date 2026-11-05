@@ -79,7 +79,10 @@
 | `llm_provider_proxy_routes_through_proxy` | ADR-L19（按供应商代理）+ `llm/forward` 后置第 11 步 | 配了 `proxy_url` 的供应商经代理转发：base_url 不可达却 200，且代理端读到 absolute-form URI（带 scheme+host），与直连的 origin-form 相区分 |
 | `llm_unreachable_proxy_returns_502` | ADR-L19 / 风险 R13 | 代理不可达与上游不可达同语义：502、消息含供应商 id、错误数 +1 |
 | `llm_admin_rejects_invalid_proxy_url` | `Provider::validate` 后置（P14） | proxy_url 为 socks5 / 非 http(s) scheme / 无 scheme / 无 host → 400（配置时拒绝，非请求时 500） |
-| `llm_admin_provider_proxy_merge_semantics` | `llm/admin` 端点表（`ProviderPatch.proxy_url`） | PUT 缺省保留代理、显式 `null` 清除回共享直连 client；清除后落盘 TOML 不含该键、重载等价无代理 |
+| `llm_admin_provider_proxy_merge_semantics` | `llm/admin` 端点表（`ProviderPatch.proxy_url`） | PUT 缺省保留代理、显式 `null` 清除回共享直连 client；清除后落盘 TOML 不含该键、重载等价无代理；GET（单项与列表）未配置时 `proxy_url` 恒为 `null`——对旧消费者是纯新增键 |
+| `llm_legacy_production_file_round_trips_without_proxy_key` | `config.rs` 持久化后置 + ADR-L13/L14 | 0.2.1 生产形态文件（单值 `protocol`、空模型表兜底、禁用供应商带模型表、注释、无代理键）在 0.2.2 下加载仅发生已知迁移；重写落盘**不多出 `proxy_url` 键**——未配代理的既有部署落盘形态与旧版一致，可原地替换 |
+| `llm_file_level_proxy_url_routes_request_through_proxy` | ADR-L19 + `config.rs` 加载后置 | 文件态端到端：往 providers.toml 直接写 `proxy_url` → 启动加载后请求**实际走该代理**（代理端读到 absolute-form URI），钉住「磁盘配置 → 启动加载 → 转发」整条链路，而非只有管理 API 一条配置路径 |
+| `llm_hand_edited_invalid_proxy_loads_but_fails_at_request_time` | `config.rs` 加载后置（加载路径不跑 `validate`）+ 风险 R13/R14 | 手工写的 socks5 `proxy_url` 能加载、启动不失败（`load_providers` 不断言代理合法），首个请求以 502「provider ... unreachable」暴露——400 闸门只在管理 API 路径上，文件态没有这道闸 |
 | `llm_admin_app_crud_and_persistence` | `llm/admin` apps 端点表 + `config.rs` 持久化 | app CRUD、合并式 PUT（models 列表替换）、key 自动生成 `sk-gw-...`、`apps.toml` 原子写回（重读断言落盘） |
 | `llm_legacy_provider_without_models_still_works` | ADR-L14 兜底兼容契约 | 无模型表的历史 provider 配置（`provider()` helper）在带 model 的请求下仍可路由——向后兼容回归 |
 | `llm_example_configs_parse_and_validate` | 示例配置维护条目（非 SDD 契约，见 `examples/README.md`） | `examples/` 两个 LLM 示例 TOML 经真实 `load_providers`/`load_apps` 解析与 `validate` 通过；分层（priority 10/1）、按供应商超时、按供应商代理、组合引用已声明模型的演示不变式成立——防示例文档随代码演进腐坏 |
