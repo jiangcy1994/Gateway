@@ -230,8 +230,16 @@ pub async fn forward(
 
     let req_method =
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
-    let upstream_request = state
-        .client
+    // 按供应商选 client（ADR-L19）：无代理走共享直连 client，有代理走按代理 url
+    // 复用的缓存 client。超时逻辑不变——timeout 仍包裹 `send()`。
+    let client = match state
+        .llm_clients
+        .get(provider.proxy_url.as_deref(), &state.client)
+    {
+        Ok(client) => client,
+        Err(e) => return error_response(e.status(), &e.to_string()),
+    };
+    let upstream_request = client
         .request(req_method, &url)
         .headers(forward)
         .body(upstream_body);

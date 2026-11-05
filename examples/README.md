@@ -1,8 +1,9 @@
 # 示例配置说明（examples/）
 
 本目录给出 LLM 子网关两个配置面与 QQ Bot 子网关一个配置面的**示例 TOML**
-与逐字段说明，覆盖模型映射、应用组合与按供应商超时（ADR-L14 / L15 / L16 /
-L17 / L18）以及 QQ 机器人三通道接入（ADR-Q8…Q13）。模板里的凭证全是
+与逐字段说明，覆盖模型映射、应用组合、按供应商超时与按供应商代理
+（ADR-L14 / L15 / L16 / L17 / L18 / L19）以及 QQ 机器人三通道接入
+（ADR-Q8…Q13）。模板里的凭证全是
 占位符，复制到部署位置后必须替换。路由表（routes.toml）沿用仓库根目录的既有
 文件与既有文档，不在本目录重复。
 
@@ -47,7 +48,7 @@ cargo run --release
 | 操作 | 语义 |
 |---|---|
 | `POST`（providers / apps / bots） | 新增；providers 的 `id`、apps 的 `id`/`key`、bots 的 `id` 省略时生成；providers 的 `models` 省略 = 空表（协议级兜底）；bots 的 `app_id`/`app_secret` 必填（缺 → 422） |
-| `PUT`（providers / apps） | **合并**：字段缺省 = 保留原值；`rpm_limit`/`tpm_limit` 显式 `null` = 不限，`timeout_secs` 显式 `null` = 回落全局默认；`protocols`/`models` 给列表 = **整体替换**（providers 的 `models` 给 `[]` = 清回空表兜底；apps 的 `models` 给 `[]` = 不限制） |
+| `PUT`（providers / apps） | **合并**：字段缺省 = 保留原值；`rpm_limit`/`tpm_limit` 显式 `null` = 不限，`timeout_secs` 显式 `null` = 回落全局默认，`proxy_url` 显式 `null` = **清除代理**（回到共享直连 client）；`protocols`/`models` 给列表 = **整体替换**（providers 的 `models` 给 `[]` = 清回空表兜底；apps 的 `models` 给 `[]` = 不限制） |
 | `PUT`（bots） | **合并**：字段缺省 = 保留原值；`api_base`/`ws_url`/`event_url`/`event_secret` 显式 `null` = **清除覆盖**（回落平台默认 / 不投递 / 不附 secret）；`event_source` 给值 = 切通道，联动 WS supervisor（websocket 且 enabled → 起连接，否则停） |
 
 ## 2. providers.example.toml 字段
@@ -64,6 +65,7 @@ cargo run --release
 | `rpm_limit` | u64 | 不限 | 每分钟请求数限额；`Some` 时必须 > 0 |
 | `tpm_limit` | u64 | 不限 | 每分钟 token 数限额，**事后**按响应尾包的 `usage` 计量（best-effort，R1） |
 | `timeout_secs` | u64 | 全局 `GATEWAY_DEFAULT_TIMEOUT_SECS` | 该供应商的上游超时（ADR-L17） |
+| `proxy_url` | string | 不代理 | 该供应商的 HTTP 代理（ADR-L19）：`http://` / `https://`，host 非空；`socks5://` 不支持（validate 直接判非法）。缺省 / 显式 `null` = 共享直连 client；代理只影响这一家供应商 |
 | `enabled` | bool | true | false 时退出所有选择池 |
 | `models` | 表列表 | 空表 | 模型映射表，见下；**空表 = 协议级兜底** |
 
@@ -210,6 +212,7 @@ websocket（`sandbox-ws`）、内网 `api_base` 覆盖且不投递事件（`inte
 | `protocol = "openai"`（单值） | `protocols = ["openai"]` | 单值仍可读，不启动失败；下一次经管理 API 写回即归一化为列表 |
 | 没有 `[[providers.models]]` | 加模型表 | 不加也能继续工作（空表 = 协议级兜底，参与任意 model 选择、不改写）——渐进迁移路径 |
 | 无 `timeout_secs` | 按供应商加 | 不加就走全局 `GATEWAY_DEFAULT_TIMEOUT_SECS`（默认 30） |
+| 无 `proxy_url` | 按供应商加 | 不加 = 共享直连 client；只有个别上游需要代理时按供应商配，不影响其余供应商 |
 | （新增文件）`apps.toml` | 见本目录示例 | 没有该文件不致命（启动告警 + 无 app）；无凭证时行为与升级前完全一致 |
 | （新增文件）`bots.toml` | 见本目录示例 | 没有该文件不致命（启动告警 + 无 bot）；`/qqbot/*` 行为与升级前完全一致 |
 
@@ -287,8 +290,8 @@ curl -X PUT http://127.0.0.1:8000/__admin/qqbot/bots/group-qa \
 - `docs/sdd/llm/overview.md`——范围与非功能约束
 - `docs/sdd/llm/data-model.md`——`Provider` / `Model` / `App` 值对象与不变式
 - `docs/sdd/llm/interfaces.md`——实现权威（本文件若与之冲突以它为准）
-- `docs/sdd/llm/decisions.md`——ADR-L14…L18 的决策背景
-- `docs/sdd/llm/risks.md`——R1 / R11 等已知风险与验证方式
+- `docs/sdd/llm/decisions.md`——ADR-L14…L19 的决策背景
+- `docs/sdd/llm/risks.md`——R1 / R11 / R13 / R14 等已知风险与验证方式
 - `docs/sdd/qqbot/data-model.md`——`Bot` 值对象与不变式 Q0…Q7
 - `docs/sdd/qqbot/interfaces.md`——QQ Bot 模块的实现权威
 - `docs/sdd/qqbot/decisions.md`——ADR-Q1…Q13 的决策背景

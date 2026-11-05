@@ -76,9 +76,13 @@
 | `llm_request_without_credential_uses_default_policy` | ADR-L15 默认策略 | 无凭证请求按全部已映射模型放行（历史 3 处 `Bearer client-key` 站点改无头后的回归基线） |
 | `llm_oversized_body_returns_413` | `llm/forward` 前置常量（`MAX_REQUEST_BODY`）+ 风险 R12 | 超过 16 MiB 的请求 body → 413，不转发 |
 | `llm_provider_timeout_overrides_global` | ADR-L17 | provider `timeout_secs=1` 指向 sleep 3s 的慢上游 → 504；不设 timeout → 走全局默认（此用例不被超时误杀） |
+| `llm_provider_proxy_routes_through_proxy` | ADR-L19（按供应商代理）+ `llm/forward` 后置第 11 步 | 配了 `proxy_url` 的供应商经代理转发：base_url 不可达却 200，且代理端读到 absolute-form URI（带 scheme+host），与直连的 origin-form 相区分 |
+| `llm_unreachable_proxy_returns_502` | ADR-L19 / 风险 R13 | 代理不可达与上游不可达同语义：502、消息含供应商 id、错误数 +1 |
+| `llm_admin_rejects_invalid_proxy_url` | `Provider::validate` 后置（P14） | proxy_url 为 socks5 / 非 http(s) scheme / 无 scheme / 无 host → 400（配置时拒绝，非请求时 500） |
+| `llm_admin_provider_proxy_merge_semantics` | `llm/admin` 端点表（`ProviderPatch.proxy_url`） | PUT 缺省保留代理、显式 `null` 清除回共享直连 client；清除后落盘 TOML 不含该键、重载等价无代理 |
 | `llm_admin_app_crud_and_persistence` | `llm/admin` apps 端点表 + `config.rs` 持久化 | app CRUD、合并式 PUT（models 列表替换）、key 自动生成 `sk-gw-...`、`apps.toml` 原子写回（重读断言落盘） |
 | `llm_legacy_provider_without_models_still_works` | ADR-L14 兜底兼容契约 | 无模型表的历史 provider 配置（`provider()` helper）在带 model 的请求下仍可路由——向后兼容回归 |
-| `llm_example_configs_parse_and_validate` | 示例配置维护条目（非 SDD 契约，见 `examples/README.md`） | `examples/` 两个 LLM 示例 TOML 经真实 `load_providers`/`load_apps` 解析与 `validate` 通过；分层（priority 10/1）、按供应商超时、组合引用已声明模型的演示不变式成立——防示例文档随代码演进腐坏 |
+| `llm_example_configs_parse_and_validate` | 示例配置维护条目（非 SDD 契约，见 `examples/README.md`） | `examples/` 两个 LLM 示例 TOML 经真实 `load_providers`/`load_apps` 解析与 `validate` 通过；分层（priority 10/1）、按供应商超时、按供应商代理、组合引用已声明模型的演示不变式成立——防示例文档随代码演进腐坏 |
 
 ## QQ Bot 子网关（`tests/qqbot_gateway.rs`）
 

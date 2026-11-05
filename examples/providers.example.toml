@@ -67,6 +67,8 @@ enabled = true
 
 # ── openai 专用：托管开放模型的另一家上游。这条网络路径较慢，timeout_secs 给
 #    得比全局默认更宽（ADR-L17）；504 消息会带上供应商 id 与实际超时秒数。
+#    该上游在部署环境里**只有走 HTTP 代理才可达**，所以配 proxy_url（ADR-L19）；
+#    代理只影响这一家供应商，其余供应商照常直连（缺省 = 共享直连 client）。
 [[providers]]
 id = "open-models"
 name = "开放模型托管"
@@ -76,6 +78,9 @@ api_key = "sk-REPLACE-WITH-REAL-KEY"
 rpm_limit = 40
 # tpm_limit = 200000                      # 注释掉 / 缺省 = 不限
 timeout_secs = 60
+proxy_url = "http://127.0.0.1:7890"        # 缺省 / null = 直连；http 与 https 代理
+                                           #   均可（https 目标走 CONNECT 隧道）；
+                                           #   socks5 不支持（validate 直接判非法）
 enabled = true
 
   [[providers.models]]
@@ -104,5 +109,6 @@ enabled = true
 # protocols = ["openai"]
 # base_url = "https://api.example.com"
 # api_key = "sk-REPLACE-WITH-REAL-KEY"
+# # proxy_url = "http://127.0.0.1:7890"    # 代理与模型表正交，兜底供应商也能配
 # enabled = true
 # # 没有 [[providers.models]] —— 空模型表即兜底语义

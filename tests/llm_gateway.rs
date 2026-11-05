@@ -42,6 +42,7 @@ fn provider(id: &str, protocol: Protocol, base_url: &str) -> Provider {
         tpm_limit: None,
         models: vec![],
         timeout_secs: None,
+        proxy_url: None,
         enabled: true,
     }
 }
@@ -58,6 +59,7 @@ fn multi_protocol_provider(id: &str, base_url: &str) -> Provider {
         tpm_limit: None,
         models: vec![],
         timeout_secs: None,
+        proxy_url: None,
         enabled: true,
     }
 }
@@ -812,6 +814,222 @@ async fn llm_unreachable_provider_returns_502() {
     let m = metrics_view(&gw, "openai-official").await;
     assert_eq!(m["stats"]["errors"], 1);
     assert_eq!(m["stats"]["total_requests"], 1);
+}
+
+// ---------------------------------------------------- 按供应商代理（ADR-L19）
+
+/// 代理端 mock：回显收到的请求行 URI。经 plain-http 代理转发时 reqwest/hyper
+/// 发 **absolute-form**（`GET http://host/path HTTP/1.1`），直连发 origin-form
+/// （`GET /path`）——代理端是否读到 scheme+host 即区分两种路径
+/// （见 hyper-util `client.rs` 的 `absolute_form`）。
+async fn spawn_mock_proxy() -> String {
+    async fn proxy_echo(method: Method, OriginalUri(uri): OriginalUri) -> Response {
+        Json(json!({
+            "method": method.as_str(),
+            "request_uri": uri.to_string(),
+        }))
+        .into_response()
+    }
+    let app = Router::new().fallback(proxy_echo);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+/// 配了 `proxy_url` 的供应商经代理转发（ADR-L19）：base_url 指向不可达端口，
+/// 请求却成功 → 必是经代理抵达；且代理端读到的是 absolute-form URI（带
+/// scheme 与目标 host），与直连的 origin-form 相区分。
+#[tokio::test]
+async fn llm_provider_proxy_routes_through_proxy() {
+    let proxy = spawn_mock_proxy().await;
+    let port = portpicker_forbidden();
+    let mut p = provider(
+        "proxied",
+        Protocol::Openai,
+        &format!("http://127.0.0.1:{port}"),
+    );
+    p.proxy_url = Some(proxy.clone());
+    let gw = spawn_llm_gateway(vec![p]).await;
+
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/openai/v1/chat/completions"))
+        .json(&json!({"model": "chat-pro", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-llm-provider"], "proxied");
+    let v: Value = resp.json().await.unwrap();
+    let request_uri = v["request_uri"].as_str().unwrap();
+    assert!(
+        request_uri.starts_with("http://127.0.0.1:"),
+        "代理端应读到 absolute-form URI，实际：{request_uri}"
+    );
+    // 代理收到的目标是 base_url（那个不可达端口），不是代理自己
+    assert!(request_uri.ends_with(&format!(":{port}/v1/chat/completions")));
+    // 去掉代理的同名请求直连不可达端口 → 502，衬托上面的 200 确实走了代理
+    let plain = provider(
+        "plain",
+        Protocol::Openai,
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let gw2 = spawn_llm_gateway(vec![plain]).await;
+    let resp2 = authed()
+        .post(gateway_url(&gw2, "/llm/openai/v1/chat/completions"))
+        .json(&json!({"model": "chat-pro", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), 502);
+}
+
+/// 代理不可达与上游不可达同语义（ADR-L19 / R13）：502，消息带供应商 id，
+/// 供应商错误数 +1。
+#[tokio::test]
+async fn llm_unreachable_proxy_returns_502() {
+    let port = portpicker_forbidden();
+    let mut p = provider("proxied", Protocol::Openai, "http://127.0.0.1:1");
+    p.proxy_url = Some(format!("http://127.0.0.1:{port}"));
+    let gw = spawn_llm_gateway(vec![p]).await;
+
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/openai/v1/chat/completions"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    // 回环 connection refused 在本机约 2s；authed 客户端 30s 超时足够不误判
+    assert_eq!(resp.status(), 502);
+    let err = error_body(resp).await;
+    assert!(err["message"].as_str().unwrap().contains("proxied"));
+
+    let m = metrics_view(&gw, "proxied").await;
+    assert_eq!(m["stats"]["errors"], 1);
+    assert_eq!(m["stats"]["total_requests"], 1);
+}
+
+/// `proxy_url` 非法形态在配置时就拒绝（P14）：socks5 / 非 http(s) scheme /
+/// 无 scheme / 无 host → 400，而不是等请求时才 500。
+#[tokio::test]
+async fn llm_admin_rejects_invalid_proxy_url() {
+    let gw = spawn_llm_gateway(vec![]).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", gw.addr);
+
+    // 合法代理可通过
+    let created: Value = client
+        .post(format!("{base}/__admin/llm/providers"))
+        .header("X-Admin-Key", ADMIN_KEY)
+        .json(&json!({
+            "id": "proxied", "protocols": ["openai"],
+            "base_url": "http://up", "api_key": "k",
+            "proxy_url": "http://127.0.0.1:7890"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(created["proxy_url"], "http://127.0.0.1:7890");
+
+    for (i, bad) in [
+        "socks5://127.0.0.1:7890",
+        "ftp://127.0.0.1:7890",
+        "127.0.0.1:7890",
+        "http://",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("bad-{i}");
+        let resp = client
+            .post(format!("{base}/__admin/llm/providers"))
+            .header("X-Admin-Key", ADMIN_KEY)
+            .json(&json!({
+                "id": id, "protocols": ["openai"],
+                "base_url": "http://up", "api_key": "k",
+                "proxy_url": bad
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "proxy_url {bad} 应被拒绝");
+    }
+}
+
+/// `proxy_url` 的 PUT 合并语义（ADR-L19）：缺省 = 保留原值；显式 `null` =
+/// 清除代理（回到共享直连 client）。清除后落盘的 TOML 不再带该键
+/// （Option None 字段在序列化时被跳过），重载等价于不配代理。
+#[tokio::test]
+async fn llm_admin_provider_proxy_merge_semantics() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![]).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", gw.addr);
+
+    let created: Value = client
+        .post(format!("{base}/__admin/llm/providers"))
+        .header("X-Admin-Key", ADMIN_KEY)
+        .json(&json!({
+            "id": "proxied", "protocols": ["openai"], "base_url": upstream,
+            "api_key": "k", "proxy_url": "http://127.0.0.1:7890"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(created["proxy_url"], "http://127.0.0.1:7890");
+
+    // 缺省 = 保留原代理
+    let merged: Value = client
+        .put(format!("{base}/__admin/llm/providers/proxied"))
+        .header("X-Admin-Key", ADMIN_KEY)
+        .json(&json!({"rpm_limit": 10}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(merged["proxy_url"], "http://127.0.0.1:7890");
+    assert_eq!(merged["rpm_limit"], 10);
+
+    // 落盘带着代理键（TOML round-trip 保留 Some 值）
+    let on_disk = std::fs::read_to_string(&gw.providers_path).unwrap();
+    assert!(on_disk.contains("proxy_url = \"http://127.0.0.1:7890\""));
+
+    // 显式 null = 清除代理，随即可直连上游（选回了共享直连 client）
+    let cleared: Value = client
+        .put(format!("{base}/__admin/llm/providers/proxied"))
+        .header("X-Admin-Key", ADMIN_KEY)
+        .json(&json!({"proxy_url": serde_json::Value::Null}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cleared["proxy_url"], serde_json::Value::Null);
+
+    let resp = authed()
+        .post(gateway_url(&gw, "/llm/openai/v1/chat/completions"))
+        .json(&json!({"model": "chat-pro", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let on_disk = std::fs::read_to_string(&gw.providers_path).unwrap();
+    assert!(!on_disk.contains("proxy_url"));
+    // 重载等价：ConfigLoad 回到无代理形态
+    let reloaded = config::load_providers(&gw.providers_path).unwrap();
+    assert_eq!(reloaded[0].proxy_url, None);
 }
 
 #[tokio::test]
@@ -2002,6 +2220,21 @@ fn llm_example_configs_parse_and_validate() {
             assert!(
                 provider.timeout_secs.is_none(),
                 "provider '{}' 应演示缺省继承超时",
+                provider.id
+            );
+        }
+    }
+    // 示例演示的按供应商代理（ADR-L19）：只有 open-models 需要经本地代理可达，
+    // 共享上游两条故意不写 proxy_url，与显式配置成对演示「缺省 = 共享直连」
+    assert_eq!(
+        open_models.proxy_url.as_deref(),
+        Some("http://127.0.0.1:7890")
+    );
+    for provider in &providers {
+        if provider.id.starts_with("shared-") {
+            assert!(
+                provider.proxy_url.is_none(),
+                "provider '{}' 应演示缺省直连",
                 provider.id
             );
         }
