@@ -9,8 +9,9 @@
 //! 本机注意事项：loopback *connection refused* 约 2s，断言 502 的测试用
 //! 充裕的 `default_timeout_secs` 与客户端超时，避免抢进 504。
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -32,6 +33,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use top_gateway::build_app;
 use top_gateway::config::{self, Settings};
+use top_gateway::qqbot::bot::{EventSource, DEFAULT_INTENTS};
 use top_gateway::state::AppState;
 
 const ADMIN_KEY: &str = "test-admin-key";
@@ -63,6 +65,7 @@ async fn spawn_qq_gateway(default_timeout_secs: u64) -> QqGateway {
     let routes_path = dir.path().join("routes.toml");
     let providers_path = dir.path().join("providers.toml");
     let bots_path = dir.path().join("bots.toml");
+    let apps_path = dir.path().join("apps.toml");
     config::save_routes(&routes_path, &[]).unwrap();
     config::save_providers(&providers_path, &[]).unwrap();
     config::save_bots(&bots_path, &[]).unwrap();
@@ -72,6 +75,7 @@ async fn spawn_qq_gateway(default_timeout_secs: u64) -> QqGateway {
         routes_file: routes_path,
         providers_file: providers_path,
         bots_file: bots_path.clone(),
+        apps_file: apps_path.clone(),
         health_interval_secs: 600,
         health_timeout_secs: 2,
         default_timeout_secs,
@@ -1217,4 +1221,125 @@ async fn ws_supervisor_resumes_session_after_abrupt_drop() {
 
     let resp = admin(&gw, "DELETE", "/__admin/qqbot/bots/wsresume", None).await;
     assert_eq!(resp.status().as_u16(), 200);
+}
+
+/// 示例配置维护条目（非 SDD 契约，见 `examples/README.md`）：钉住
+/// `examples/bots.example.toml` 经真实 `load_bots` 解析与 `validate` 通过，
+/// 且示例刻意演示的形态不变式成立——防示例文档随代码演进腐坏。
+#[test]
+fn qqbot_example_configs_parse_and_validate() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let bots_path = root.join("examples").join("bots.example.toml");
+    assert!(bots_path.exists(), "missing {}", bots_path.display());
+
+    let bots = config::load_bots(&bots_path)
+        .unwrap_or_else(|e| panic!("parse {}: {e}", bots_path.display()));
+
+    assert_eq!(bots.len(), 3, "示例应含 3 个机器人");
+    for bot in &bots {
+        bot.validate()
+            .unwrap_or_else(|e| panic!("bot '{}' 无效: {e}", bot.id));
+        // 占位凭证必须保持占位形态——示例文件永远不携带真实 app_secret /
+        // event_secret（examples/README.md 第 8 节：三个示例文件里的所有
+        // api_key / key / app_secret / event_secret 都是占位符）
+        assert!(
+            bot.app_secret.contains("REPLACE-WITH"),
+            "bot '{}' 的 app_secret 必须是占位符",
+            bot.id
+        );
+        if let Some(secret) = &bot.event_secret {
+            assert!(
+                secret.contains("REPLACE-WITH"),
+                "bot '{}' 的 event_secret 必须是占位符",
+                bot.id
+            );
+        }
+    }
+
+    // id / app_id 全表唯一（load_bots 对重复只告警不拒绝，示例必须自己干净）
+    let ids: HashSet<_> = bots.iter().map(|b| b.id.clone()).collect();
+    let app_ids: HashSet<_> = bots.iter().map(|b| b.app_id.clone()).collect();
+    assert_eq!(ids.len(), bots.len(), "示例的 id 必须互不相同");
+    assert_eq!(app_ids.len(), bots.len(), "示例的 app_id 必须互不相同");
+
+    // 两通道形态都覆盖（webhook 缺省 + websocket 主动连接）
+    let sources: Vec<_> = bots.iter().map(|b| b.event_source).collect();
+    assert!(
+        sources.contains(&EventSource::Webhook),
+        "缺 webhook 形态示例"
+    );
+    assert!(
+        sources.contains(&EventSource::Websocket),
+        "缺 websocket 形态示例"
+    );
+    // 只有 websocket 形态需要后台连接（enabled && websocket，联动 supervisor）
+    assert_eq!(
+        bots.iter().filter(|b| b.ws_needs_connection()).count(),
+        1,
+        "应只有一条机器人需要 WS 连接"
+    );
+
+    // 环境切换与逐机器人 URL 覆盖（ADR-Q12）：按 id 钉住形态归属——
+    // 只数个数拴不住示例文件与 examples/README.md 宣称的对应关系
+    // （sandbox-ws = 沙箱 websocket；internal-relay = api_base 覆盖），
+    // sandbox=true 挪到别的机器人上会让两份文档悄悄变错。LLM 示例测试
+    // 同样按 provider id 钉住分层组合，见 tests/llm_gateway.rs。
+    assert_eq!(
+        bots.iter()
+            .filter(|b| b.sandbox)
+            .map(|b| b.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["sandbox-ws"],
+        "演示沙箱形态的应是 sandbox-ws"
+    );
+    assert_eq!(
+        bots.iter()
+            .filter(|b| b.sandbox && b.event_source == EventSource::Websocket)
+            .count(),
+        1,
+        "sandbox-ws 应同时演示 websocket 形态"
+    );
+    assert_eq!(
+        bots.iter()
+            .filter(|b| b.api_base.is_some())
+            .map(|b| b.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["internal-relay"],
+        "演示 api_base 覆盖的应是 internal-relay"
+    );
+    assert!(
+        bots.iter().all(|b| b.ws_url.is_none()),
+        "示例不应依赖推断值之外的 ws_url（escape hatch 保持注释形态）"
+    );
+
+    // intents：显式写出的值与省略的缺省值都必须等于平台默认掩码
+    for bot in &bots {
+        assert_eq!(
+            bot.intents, DEFAULT_INTENTS,
+            "bot '{}' 的 intents 应为默认掩码",
+            bot.id
+        );
+    }
+
+    // 一条机器人不设 event_url：演示「事件计错误后丢弃」分支（R6）
+    assert_eq!(
+        bots.iter()
+            .filter(|b| b.event_url.is_none())
+            .map(|b| b.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["internal-relay"],
+        "演示不投递事件的应是 internal-relay"
+    );
+    // 投递凭证钉在 group-qa 上，且必须与 event_url 同体才生效——
+    // deliver_event 在无 event_url 时直接计错误丢弃、event_secret 根本
+    // 不读（webhook.rs），secret 被挪到不投递的机器人上就是死配置
+    assert_eq!(
+        bots.iter()
+            .filter(|b| b.event_url.is_some() && b.event_secret.is_some())
+            .map(|b| b.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["group-qa"],
+        "演示投递凭证的应是 group-qa（须与 event_url 同体才生效）"
+    );
+    assert!(bots.iter().all(|b| b.enabled), "示例机器人应全部启用");
 }
