@@ -25,6 +25,7 @@ cargo fmt && cargo clippy --all-targets
 | `GATEWAY_ADMIN_KEY` | 未设置 | `/__admin/*` 的密钥；未设置时告警且放行 |
 | `GATEWAY_ROUTES_FILE` | `routes.toml` | 路由配置文件 |
 | `GATEWAY_PROVIDERS_FILE` | `providers.toml` | LLM 供应商配置文件 |
+| `GATEWAY_APPS_FILE` | `apps.toml` | LLM 应用（模型组合）配置文件 |
 | `GATEWAY_BOTS_FILE` | `bots.toml` | QQ 机器人配置文件 |
 | `GATEWAY_HEALTH_INTERVAL_SECS` | `10` | 健康检查轮询间隔 |
 | `GATEWAY_HEALTH_TIMEOUT_SECS` | `2` | 单次健康探测超时 |
@@ -92,9 +93,10 @@ curl -X PUT http://127.0.0.1:8000/__admin/routes/svc \
 
 ## LLM 网关（`/llm/{protocol}/*`）
 
-内嵌子网关：同一入口下按协议选择供应商池，客户端协议原样透传（不做协议
-互转），按供应商的 RPM/TPM 剩余配额加权选择；配额按**整个供应商**（底下全
-部模型合计）计算，60 秒滚动窗口。两种入站形态：
+内嵌子网关：同一入口下按**协议 + 模型**选择供应商池，客户端协议原样透传
+（不做协议互转）；请求带 `model` 时按「供应商-模型」条目的 `priority` **分层**
+——高优先级层先用，其配额耗尽才降层，层内按 RPM/TPM 剩余配额加权随机。
+配额按**整个供应商**（底下全部模型合计）计算，60 秒滚动窗口。两种入站形态：
 
 - **`/llm/v1/{端点}`**：SDK 的 base_url 直接指 `http://gw:8000/llm/v1`，网关按
   端点名推断协议（`chat/completions` 等 → openai，`messages` 等 → anthropic），
@@ -112,12 +114,12 @@ curl -X PUT http://127.0.0.1:8000/__admin/routes/svc \
 
 ```bash
 # OpenAI / Anthropic SDK 直接指 /llm/v1（按端点推断协议）
-curl http://127.0.0.1:8000/llm/v1/chat/completions -d '{"model":"gpt-4o",...}'
-curl http://127.0.0.1:8000/llm/v1/messages -d '{"model":"claude-opus-4-1",...}'
+curl http://127.0.0.1:8000/llm/v1/chat/completions -d '{"model":"chat-pro",...}'
+curl http://127.0.0.1:8000/llm/v1/messages -d '{"model":"chat-max",...}'
 
 # 显式协议段（无歧义；v1 下推断不了的端点用这个）
 curl http://127.0.0.1:8000/llm/openai/v1/chat/completions \
-  -d '{"model":"gpt-4o","messages":[...]}'
+  -d '{"model":"chat-pro","messages":[...]}'
 
 # 响应头 x-llm-provider 指出本次选中的供应商
 ```
@@ -126,15 +128,54 @@ curl http://127.0.0.1:8000/llm/openai/v1/chat/completions \
 
 ```toml
 [[providers]]
-id = "openai-official"
-name = "OpenAI"
+id = "primary-upstream"
+name = "主用上游"
 protocols = ["openai"]           # openai | anthropic | systemone；可多选共享配额
-base_url = "https://api.openai.com"
+base_url = "https://api.example.com"
 api_key = "sk-..."
 rpm_limit = 60                   # 每分钟请求数限额，缺省 = 不限
 tpm_limit = 100000               # 每分钟 token 数限额，缺省 = 不限
+timeout_secs = 30                # 该供应商的上游超时，缺省 = GATEWAY_DEFAULT_TIMEOUT_SECS
 enabled = true
+
+  [[providers.models]]           # 模型映射表，缺省 = 空表（协议级兜底，见下）
+  name = "chat-pro"              # 网关侧模型名：客户端请求里写它（app 组合里也写它）
+  upstream = "chat-pro-2026-04"  # 上游真实模型名，缺省 = name（相同时零差异透传）
+  priority = 10                  # 越大越优先；缺省 = 0
 ```
+
+**模型映射**：客户端始终写网关侧模型名，网关在转发前把请求 body 里的 `model`
+字段改写成上游真实名（上游响应原样回吐，不做反向改写）。同一条网关模型名可
+以被多个供应商声明（各配不同 `upstream` 与 `priority`）：请求按 `priority`
+降序分层，高优先级层有剩余配额就不会落到低层。**空模型表 = 协议级兜底**：
+该供应商参与任意 model 请求的选择、不改写 `model` 字段，但 effective priority
+为 `i32::MIN`——只要有一个供应商显式声明了该模型，兜底就永远排在最后。这让
+不带模型表的旧部署继续工作，也给了渐进迁移路径。
+
+**应用组合**（`apps.toml`）：入站凭证即应用身份——客户端把网关签发的 key 填在
+SDK 原本填供应商 key 的位置（`Authorization: Bearer <key>` 或 `x-api-key`），
+网关据此识别来源 app 并限制其可用模型集合；同时客户端凭证一律被替换成选中
+供应商的凭证。
+
+> 完整示例配置（按真实拓扑示范模型映射、分层兜底、按供应商超时与应用组合）
+> 见 [examples/](examples/)——示例文件由 `llm_example_configs_parse_and_validate`
+> 钉住解析与 `validate`，不会随代码演进腐坏。
+
+```toml
+[[apps]]
+id = "cli-code"                  # 省略时生成 UUID；显式空串/纯白空白 = 400
+name = "Claude Code CLI"         # 展示名，缺省空串
+key = "sk-gw-cli-code-xxxx"      # 省略时生成 sk-gw-<uuid v4 simple>；表内唯一
+models = ["chat-pro", "chat-max"]        # 空表 = 不限制
+enabled = true                   # false 时该 key 得 403
+```
+
+凭证语义：**无凭证 = 默认策略放行**（全部已映射模型）；有凭证但不命中任何
+app → `401`（fail-closed：瞎写的 key 不能换来权限）；命中但请求 model 不在
+组合内 → `403`。key 比较用常量时间。注意组合限制只覆盖 body 里带 `model`
+字段的 JSON 请求——无 model / 非 JSON 的请求不拦截，按协议级路由放行
+（已知盲区，见 `docs/sdd/llm/risks.md`）；超出 16 MiB 缓冲上限的请求直接
+`413` 拒绝，不进入盲区。
 
 LLM 管理端点（同样需要 `X-Admin-Key`）：
 
@@ -143,13 +184,18 @@ LLM 管理端点（同样需要 `X-Admin-Key`）：
 | GET | `/__admin/llm/providers` | 列出全部供应商 |
 | POST | `/__admin/llm/providers` | 新增供应商；`id` 省略时生成 UUID |
 | GET/PUT/DELETE | `/__admin/llm/providers/{id}` | 查看 / 合并式更新 / 删除（PUT 显式 `null` = 设为不限） |
+| GET | `/__admin/llm/apps` | 列出全部应用（含 key） |
+| POST | `/__admin/llm/apps` | 新增应用；`id`/`key` 省略时生成 |
+| GET/PUT/DELETE | `/__admin/llm/apps/{id}` | 查看 / 合并式更新 / 删除 |
 | GET | `/__admin/llm/quota` | 各供应商窗口内 RPM/TPM 用量与余量 |
 | GET | `/__admin/llm/metrics` | 各供应商请求数 / 并发 / 错误数 / 平均延迟 |
 
-选择行为：所有供应商满 RPM 或 TPM → `429`（`QuotaExhausted`）；协议下无启用
-供应商 → `503`；`/llm/v1` 下两协议共用或未登记的端点 → `404`。TPM 由响应尾包
-里的 `usage` 字段事后计量（非流式取 JSON，流式取末尾 `data:` 块），解析不到时
-记 0，永不失败。
+选择行为：带 `model` 时，无任何供应商声明该模型 → `404`（`ModelNotFound`，
+提示去 `/__admin/llm/providers` 登记模型表）；模型有声明但池空（全 disabled /
+协议不匹配）→ `503`（`NoProviderForModel`）；所有层都满 RPM 或 TPM → `429`
+（`QuotaExhausted`）；不带 `model` 时维持原语义——协议下无启用供应商 → `503`。
+`/llm/v1` 下两协议共用或未登记的端点 → `404`。TPM 由响应尾包里的 `usage`
+字段事后计量（非流式取 JSON，流式取末尾 `data:` 块），解析不到时记 0，永不失败。
 
 ## QQ Bot 网关（`/qqbot/*`）
 
@@ -180,7 +226,7 @@ curl http://127.0.0.1:8000/qqbot/1020304050/users/@me
 
 ```toml
 [[bots]]
-id = "my-bot"                     # 配置 id（省略时生成 UUID）
+id = "my-bot"                     # 配置 id（TOML 必填；仅管理 API 可省略生成 UUID）
 name = "我的机器人"
 app_id = "102030405"              # 平台 appId（路由键，全表唯一）
 app_secret = "DG5g3B4j9X2KOErG"   # 平台 clientSecret，明文落盘（同 api_key 策略）
@@ -191,6 +237,10 @@ intents = 100663296               # 缺省 (1<<25)|(1<<26)
 # event_secret = "..."                         # 投递时附 Bearer
 # enabled = true
 ```
+
+> 完整示例配置（三通道形态、沙箱切换、逐机器人 URL 覆盖与临时停用）见
+> [examples/](examples/)——示例文件由 `qqbot_example_configs_parse_and_validate`
+> 钉住解析与 `validate`，不会随代码演进腐坏。
 
 QQ Bot 管理端点（同样需要 `X-Admin-Key`）：
 
@@ -207,9 +257,9 @@ QQ Bot 管理端点（同样需要 `X-Admin-Key`）：
 
 ## 持久化
 
-每次经管理 API 的路由 / 供应商 / 机器人变更都会原子写回对应文件
-（`routes.toml` / `providers.toml` / `bots.toml`，临时文件 + rename），
-重启不丢失；注意重写会丢弃文件里的注释。
+每次经管理 API 的路由 / 供应商 / 应用 / 机器人变更都会原子写回对应文件
+（`routes.toml` / `providers.toml` / `apps.toml` / `bots.toml`，临时文件 +
+rename），重启不丢失；注意重写会丢弃文件里的注释。
 
 ## 部署为 Windows 服务
 
@@ -234,6 +284,7 @@ QQ Bot 管理端点（同样需要 `X-Admin-Key`）：
 %ProgramData%\top-gateway\
   ├─ routes.toml       # install 时从 exe 同目录补种缺失文件，之后由管理 API 维护
   ├─ providers.toml
+  ├─ apps.toml
   ├─ bots.toml
   ├─ gateway.env       # KEY=VALUE，服务进程的唯一环境来源（install 时生成模板）
   └─ top-gateway.log.YYYY-MM-DD   # 按日滚动（当前文件即带日期后缀）
@@ -249,15 +300,16 @@ GATEWAY_BIND=0.0.0.0:8000
 
 注意事项：
 
-- 相对路径的 `GATEWAY_ROUTES_FILE` / `GATEWAY_PROVIDERS_FILE` / `GATEWAY_BOTS_FILE`
-  在服务模式下解析到服务基目录；控制台模式仍按 cwd 解析，行为不变。
-  `GATEWAY_BASE_DIR` 可覆盖基目录位置。
+- 相对路径的 `GATEWAY_ROUTES_FILE` / `GATEWAY_PROVIDERS_FILE` / `GATEWAY_APPS_FILE`
+  / `GATEWAY_BOTS_FILE` 在服务模式下解析到服务基目录；控制台模式仍按 cwd
+  解析，行为不变。`GATEWAY_BASE_DIR` 可覆盖基目录位置。
 - 直接双击服务模式的 exe（无参数、未连上 SCM）会报 1063 错误并提示用
   `run` / `install`。
 - 服务只接受 `SERVICE_CONTROL_STOP`，不接受系统关机通知——在关机时限内排空
   代理请求只会拖延关机（ADR-013）。
 - `gateway.env` 里的 `GATEWAY_ADMIN_KEY` 是明文，和 `providers.toml` 里的
-  `api_key`、`bots.toml` 里的 `app_secret` 一样（ADR-012 / ADR-L11 / ADR-Q11）：
-  依靠 %ProgramData% 的默认 ACL 限制访问，不要把密钥写进交给版本管理的模板。
+  `api_key`、`apps.toml` 里的 `key`、`bots.toml` 里的 `app_secret` 一样
+  （ADR-012 / ADR-L11 / ADR-L18 / ADR-Q11）：依靠 %ProgramData% 的默认 ACL
+  限制访问，不要把密钥写进交给版本管理的模板。
   另注意 `/qqbot/*` 本身不做客户端鉴权（`/llm/*` 同理）——部署侧绑定回环或前置反代。
 

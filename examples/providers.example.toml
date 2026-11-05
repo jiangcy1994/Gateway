@@ -1,0 +1,108 @@
+# top-gateway LLM 供应商示例配置。
+#
+# 这是模板，不是正式文件：所有 api_key 都是占位符，复制到部署位置后必须替换
+# 为真实凭证（ADR-L11：api_key 明文落盘，依靠部署位置的访问控制）。正式文件
+# 一旦经管理 API 修改就会被网关整体重写（临时文件 + rename，重写丢注释），
+# 本文件不受网关管理，可以放心写注释。
+#
+# 字段的权威定义见 src/llm/provider.rs 与 docs/sdd/llm/data-model.md；
+# 选择 / 改写 / 超时行为见 docs/sdd/llm/interfaces.md 与 README 的 LLM 段。
+#
+# 供应商与模型名一律是**匿名占位**，只为演示拓扑（共享上游主备分层、开放模型
+# 按供应商超时、协议级兜底），换成你自己的真实供应商即可。
+
+# ── 主用层：一个共享上游网关。一个 base_url 同时侍奉 openai 与 anthropic 两套
+#    端点（ADR-L13），所以 protocols 写两个；但 RPM/TPM 配额按整个供应商计，
+#    两个协议共用同一份。模型名以供应商 /v1/models 实际返回为准，以下是示例。
+[[providers]]
+id = "shared-primary"                      # 表内唯一；管理 API 的路由键
+name = "共享上游 · 主用"                    # 展示名，缺省空串
+protocols = ["openai", "anthropic"]        # openai | anthropic | systemone；旧形态单值
+                                           #   protocol = "openai" 仍可读，列表才是规范形态
+base_url = "https://llm-shared.example.com"
+api_key = "sk-REPLACE-WITH-REAL-KEY"       # 明文落盘（ADR-L11）
+rpm_limit = 50                             # 每分钟请求数限额；缺省 = 不限
+tpm_limit = 2000000                        # 每分钟 token 数限额（事后按响应 usage 计量）；缺省 = 不限
+# timeout_secs                            # 不写 = 继承 GATEWAY_DEFAULT_TIMEOUT_SECS（ADR-L17）；
+                                           #   要覆盖时像下面 open-models 那样显式给
+enabled = true                             # 缺省 true；false 时该供应商退出所有池
+
+  # 模型映射表（ADR-L14），缺省 = 空表（协议级兜底，见文件末尾示例）：
+  #   name     = 网关侧模型名——客户端请求里写它，apps 的模型组合里也写它
+  #   upstream = 上游真实模型名，缺省 = name（与 name 相同时原始 body 零差异透传）
+  #   priority = 越大越优先，缺省 = 0；同一网关模型名可被多个供应商声明（ADR-L16）
+  [[providers.models]]
+  name = "chat-pro"
+  upstream = "chat-pro-2026-04"
+  priority = 10                            # 主用层：有剩余配额就永远优先于兜底层
+
+  [[providers.models]]
+  name = "chat-max"
+  upstream = "chat-max-2026-04"
+  priority = 10
+
+# ── 兜底层：同一家共享上游的第二个账号（独立 key → 独立配额）。声明**同样的**
+#    网关模型名，但 priority 压低——主用层配额耗尽（weight 归零）才会降层到这里
+#    （ADR-L16）。层内仍是剩余配额加权随机，不是严格主备切换。
+[[providers]]
+id = "shared-fallback"
+name = "共享上游 · 兜底"
+protocols = ["openai", "anthropic"]
+base_url = "https://llm-shared.example.com"
+api_key = "sk-REPLACE-WITH-REAL-KEY"
+rpm_limit = 50
+tpm_limit = 2000000
+# timeout_secs = 30                       # 同上：不写 = 继承全局默认
+enabled = true
+
+  [[providers.models]]
+  name = "chat-pro"
+  upstream = "chat-pro-2026-04"
+  priority = 1
+
+  [[providers.models]]
+  name = "chat-max"
+  upstream = "chat-max-2026-04"
+  priority = 1
+
+# ── openai 专用：托管开放模型的另一家上游。这条网络路径较慢，timeout_secs 给
+#    得比全局默认更宽（ADR-L17）；504 消息会带上供应商 id 与实际超时秒数。
+[[providers]]
+id = "open-models"
+name = "开放模型托管"
+protocols = ["openai"]
+base_url = "https://open-models.example.net"
+api_key = "sk-REPLACE-WITH-REAL-KEY"
+rpm_limit = 40
+# tpm_limit = 200000                      # 注释掉 / 缺省 = 不限
+timeout_secs = 60
+enabled = true
+
+  [[providers.models]]
+  name = "reason-large"
+  upstream = "hub/reason-large"
+  priority = 10
+
+  [[providers.models]]
+  name = "chat-70b"
+  upstream = "hub/chat-70b-instruct"
+  priority = 10
+
+  [[providers.models]]
+  name = "coder-32b"
+  upstream = "hub/coder-32b-instruct"
+  priority = 10
+
+# ── 协议级兜底（空模型表，ADR-L14）：不声明任何模型，参与**任意** model 请求
+#    的选择、不改写 model 字段，effective priority = i32::MIN——只要有一家显式
+#    声明了该模型，兜底永远排在最后。适合渐进迁移：先挂上来保底，登记好模型表
+#    后再删掉。需要时取消注释。
+#
+# [[providers]]
+# id = "catchall-openai"
+# name = "协议级兜底"
+# protocols = ["openai"]
+# base_url = "https://api.example.com"
+# api_key = "sk-REPLACE-WITH-REAL-KEY"
+# enabled = true
+# # 没有 [[providers.models]] —— 空模型表即兜底语义
