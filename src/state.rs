@@ -4,6 +4,7 @@ use std::sync::{Arc, RwLock};
 use crate::config::{self, Settings};
 use crate::error::ApiError;
 use crate::health::HealthState;
+use crate::llm::app::AppTable;
 use crate::llm::provider::ProviderTable;
 use crate::llm::quota::QuotaTracker;
 use crate::metrics::RouteStats;
@@ -24,6 +25,7 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub routes: RouteTable,
     pub providers: ProviderTable,
+    pub apps: AppTable,
     pub bots: BotTable,
     pub bot_tokens: TokenStore,
     pub bot_ws: WsTable,
@@ -44,6 +46,7 @@ impl AppState {
             client,
             routes: RouteTable::default(),
             providers: ProviderTable::default(),
+            apps: AppTable::default(),
             bots: BotTable::default(),
             bot_tokens: TokenStore::new(),
             bot_ws: WsTable::new(),
@@ -123,5 +126,10 @@ impl AppState {
     /// Same contract as `persist`, for the bots table（ADR-Q1：独立配置面）。
     pub fn persist_bots(&self) -> Result<(), ApiError> {
         config::save_bots(&self.settings.bots_file, &self.bots.list())
+    }
+
+    /// Same contract as `persist`, for the apps table（ADR-L18：独立配置面）。
+    pub fn persist_apps(&self) -> Result<(), ApiError> {
+        config::save_apps(&self.settings.apps_file, &self.apps.list())
     }
 }

@@ -6,9 +6,10 @@ use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 
 use crate::error::ApiError;
+use crate::llm::app;
 use crate::llm::balancer;
 use crate::llm::provider::{infer_protocol, InferError, Protocol};
 use crate::llm::quota::QuotaTracker;
@@ -19,8 +20,13 @@ use crate::state::AppState;
 /// 保留前缀：`nest` 优先于 routes fallback（ADR-L5）。
 pub const LLM_PREFIX: &str = "/llm";
 
-/// `/llm` nest 的 fallback 处理器：剥前缀 → 协议段选池 → 按协议注入凭证 →
-/// 透传（流式）→ 尾包提取 usage 记 TPM。
+/// 请求 body 的缓冲上限（ADR-L14）：为了改写 `model` 字段，请求 body 不再
+/// 流式；超限直接 413——截断转发没有意义（上游只会回 400）。
+pub const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
+
+/// `/llm` nest 的 fallback 处理器：剥前缀 → 解析 app → 缓冲 body 取 model →
+/// 组合校验 → 分层选供应商 → 按需改写 model → 注入凭证 → 透传（响应流式）
+/// → 尾包提取 usage 记 TPM。
 pub async fn forward(
     State(state): State<AppState>,
     method: Method,
@@ -90,16 +96,72 @@ pub async fn forward(
         (protocol, target_path)
     };
 
-    let provider = match balancer::select_and_record(&state, protocol) {
-        Ok(provider) => provider,
-        Err(ApiError::NoProviderForProtocol(msg)) => {
-            return error_response(StatusCode::SERVICE_UNAVAILABLE, &msg)
-        }
-        Err(ApiError::QuotaExhausted(msg)) => {
-            return error_response(StatusCode::TOO_MANY_REQUESTS, &msg)
-        }
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    // app 解析（ADR-L15）：无凭证 = 默认策略（放行）；有凭证但不命中任何
+    // app = 401 fail-closed；命中但禁用 = 403。组合校验在 model 解出之后。
+    let app = match app::credential_from_headers(&headers) {
+        Some(credential) => match state.apps.find_by_key(&credential) {
+            Some(found) if found.enabled => Some(found),
+            Some(found) => {
+                return error_response(
+                    StatusCode::FORBIDDEN,
+                    &ApiError::AppDisabled(found.id).to_string(),
+                )
+            }
+            None => {
+                return error_response(
+                    StatusCode::UNAUTHORIZED,
+                    &ApiError::UnknownAppKey.to_string(),
+                )
+            }
+        },
+        None => None,
     };
+
+    // 缓冲请求 body（上限 MAX_REQUEST_BODY）：非 JSON / 无 model 字段都算
+    // 「无 model」，按协议级路由放行（盲区 R11）。
+    let body = match read_request_body(request).await {
+        Ok(body) => body,
+        Err(BodyReadError::TooLarge) => {
+            return error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                &ApiError::RequestBodyTooLarge.to_string(),
+            )
+        }
+        Err(BodyReadError::Failed(err)) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to read request body: {err}"),
+            )
+        }
+    };
+    let (model, mut parsed) = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(value) => {
+            let model = value
+                .get("model")
+                .and_then(|m| m.as_str())
+                .map(str::to_string);
+            (model, Some(value))
+        }
+        Err(_) => (None, None),
+    };
+
+    // 组合校验：只有 app 与请求 model 都明确时才检查（ADR-L15/R11）。
+    if let (Some(app), Some(model)) = (app.as_ref(), model.as_deref()) {
+        if !app.models.is_empty() && !app.models.iter().any(|m| m == model) {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                &ApiError::ModelNotAllowedForApp(model.to_string(), app.id.clone()).to_string(),
+            );
+        }
+    }
+
+    let selection = match balancer::select_and_record(&state, protocol, model.as_deref()) {
+        Ok(selection) => selection,
+        // 其余变体（ModelNotFound → 404、NoProviderForModel → 503、
+        // QuotaExhausted → 429 …）一律按 `ApiError::status` 走，两处不再各写一张表。
+        Err(e) => return error_response(e.status(), &e.to_string()),
+    };
+    let provider = selection.provider;
 
     let stats = state.llm_stats_for(&provider.id);
     let _guard = stats.guard();
@@ -144,17 +206,42 @@ pub async fn forward(
         forward.insert("x-forwarded-path", value);
     }
 
+    // 改写（ADR-L14）：仅当选中条目的上游名与请求 model 不同时才重新序列化；
+    // 值相同、或兜底（空模型表）供应商命中时，原始 bytes 零差异透传。
+    let mut upstream_body = body;
+    if let Some(upstream_model) = selection.upstream_model.as_deref() {
+        if Some(upstream_model) != model.as_deref() {
+            // parsed 只可能在 model 为 Some 时为 Some——逻辑上 else 分支走不到，
+            // 兜底为原样转发（上游收到客户端写的 model）。
+            if let Some(value) = parsed.as_mut() {
+                value["model"] = serde_json::Value::String(upstream_model.to_string());
+                match serde_json::to_vec(value) {
+                    Ok(rewritten) => upstream_body = Bytes::from(rewritten),
+                    Err(err) => {
+                        return error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            &format!("failed to rewrite model field: {err}"),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     let req_method =
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
     let upstream_request = state
         .client
         .request(req_method, &url)
         .headers(forward)
-        .body(reqwest::Body::wrap_stream(
-            request.into_body().into_data_stream(),
-        ));
+        .body(upstream_body);
 
-    let timeout = Duration::from_secs(state.settings.default_timeout_secs);
+    // 按供应商 timeout（ADR-L17）；缺省回落全局 `GATEWAY_DEFAULT_TIMEOUT`。
+    let timeout = Duration::from_secs(
+        provider
+            .timeout_secs
+            .unwrap_or(state.settings.default_timeout_secs),
+    );
     let upstream = match tokio::time::timeout(timeout, upstream_request.send()).await {
         Ok(Ok(response)) => response,
         Ok(Err(err)) => {
@@ -216,6 +303,28 @@ pub async fn forward(
         )
         .into_response()
     })
+}
+
+/// `read_request_body` 的失败区分：超上限 → 413；其他读错误 → 500。
+enum BodyReadError {
+    TooLarge,
+    Failed(axum::Error),
+}
+
+/// 把请求 body 全量读进 `Bytes`，超过 [`MAX_REQUEST_BODY`] 即停止并报
+/// `TooLarge`（不截断、不转发——ADR-L14）。无 body 的请求（GET 等）得到
+/// 空的 `Bytes`，随后的 model 解析自然回落到「无 model」。
+async fn read_request_body(request: Request) -> Result<Bytes, BodyReadError> {
+    let mut stream = request.into_body().into_data_stream();
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(BodyReadError::Failed)?;
+        if buf.len() + chunk.len() > MAX_REQUEST_BODY {
+            return Err(BodyReadError::TooLarge);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(buf))
 }
 
 /// 响应流 tap：每块向客户端转发的同时复制进 `TailBuffer`；流正常结束 /

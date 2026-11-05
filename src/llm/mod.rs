@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod app;
 pub mod balancer;
 pub mod forward;
 pub mod provider;

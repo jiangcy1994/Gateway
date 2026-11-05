@@ -1,0 +1,91 @@
+# top-gateway QQ 机器人示例配置。
+#
+# 这是模板，不是正式文件：app_secret / event_secret 都是占位符，复制到部署
+# 位置后必须替换为真实凭证（ADR-Q11：app_secret 明文落盘，与 providers 的
+# api_key 同级，依靠部署位置的访问控制）。正式文件一旦经管理 API 修改就会
+# 被网关整体重写（临时文件 + rename，重写丢注释），本文件不受网关管理，
+# 可以放心写注释。
+#
+# 三路接入共用同一张机器人表（README「QQ Bot 网关」段）：
+#   1. OpenAPI 透传 /qqbot/{app_id}/...       —— 路径首段 app_id 是路由键，
+#      网关自动换发并缓存 access_token，注入 Authorization: QQBot <token>
+#   2. Webhook 回调 /qqbot/callback/{app_id}  —— op 13 回调地址验证即时
+#      回签 ed25519（只签不验，ADR-Q7）；其余 op（含 op 0 事件）先 ACK
+#      （{"op":12}）再异步投递到 event_url（ADR-Q13）
+#   3. WebSocket 客户端（event_source = "websocket"）—— 网关后台连 wss，
+#      Identify → READY → 周期心跳 → 事件投递到同一个 event_url
+#
+# 字段的权威定义见 src/qqbot/bot.rs 与 docs/sdd/qqbot/data-model.md；
+# 通道行为（换 token / 签名 / 心跳 / 关闭码分流）见 docs/sdd/qqbot/interfaces.md。
+
+# ── 1. 群答疑机器人：webhook 形态（缺省）。平台把事件推到
+#    /qqbot/callback/{app_id}，网关先 ACK 再异步投递到 event_url
+#    （at-most-once：失败只计错误不重试——ADR-Q13）。
+[[bots]]
+id = "group-qa"                             # 配置 id：表内唯一、管理 API 的路由键
+                                            #   （TOML 必填；仅 POST 可省略，生成 UUID）
+name = "群答疑机器人"                        # 展示名，缺省空串
+app_id = "1020304050"                       # 平台 appId：三通道的路由键，全表唯一
+app_secret = "REPLACE-WITH-CLIENT-SECRET"   # 换 access_token 的 clientSecret，
+                                            #   也是回调 op 13 签名的 ed25519 种子；
+                                            #   明文落盘（ADR-Q11）
+sandbox = false                             # 缺省 false；true → api/ws 地址都切到
+                                            #   sandbox.api.bot.qq.com
+intents = 100663296                         # (1<<25)|(1<<26)：群/私聊 + 互动；
+                                            #   缺省同值；0 非法
+shard = [0, 1]                              # 缺省 [0,1]；[分片 id, 总数]，须
+                                            #   id < total；透传给 Identify 但网关
+                                            #   一机器人一条连接（ADR-Q9 / R11）
+event_source = "webhook"                    # 缺省 webhook
+event_url = "http://127.0.0.1:9000/qq/events"    # 事件投递目标；须 http(s)://host
+event_secret = "evt-REPLACE-WITH-REAL-SECRET"    # 投递时附 Bearer；空串等同不设
+enabled = true                              # 缺省 true
+
+# ── 2. 沙箱调试机器人：websocket 形态——网关主动连 wss（后台 supervisor：
+#    Identify → READY → 周期心跳 → 事件投递），断线按平台关闭码分流重连
+#    （4008/4009 可 Resume、4900 段重新 Identify、4010 段停止不重连），
+#    退避 2s→60s。网关不校验 event_source 与平台权限的组合——配错形态由
+#    平台用 op 9 / 关闭码 4014 拒绝（ADR-Q10）。
+[[bots]]
+id = "sandbox-ws"
+name = "沙箱调试机器人"
+app_id = "1020304066"
+app_secret = "REPLACE-WITH-CLIENT-SECRET"
+sandbox = true                              # 沙箱：api_base 与 ws 接入点都按
+                                            #   sandbox.api.bot.qq.com 解析
+event_source = "websocket"                  # 后台连 wss；webhook 缺省则被动等
+event_url = "http://127.0.0.1:9000/qq/events"
+# ws_url = "wss://sandbox.api.bot.qq.com/websocket/"
+#   沙箱的 WSS 接入点是推断值（R10），实机连不上时用 ws_url 逐机器人覆盖
+#   （ADR-Q12）；须 ws(s)://host 形式。正式环境通常不需要写。
+# intents / shard / event_secret 省略 = 各自缺省：intents = 100663296、
+#   shard = [0,1]（恰与上一条同值）；event_secret 省略 = 不附 Bearer——
+#   各 [[bots]] 表互相独立，不继承上一条的值
+enabled = true
+
+# ── 3. 内网反代机器人：逐机器人 api_base 覆盖（ADR-Q12）——指向自建 mock、
+#    内网反代或测试订阅器时不必改全局；正式与内网机器人可混跑在同一网关里。
+#    不写 event_url = 事件计 stats 后丢弃（/__admin/qqbot/metrics 的错误数
+#    可见，R6）——适合只要 OpenAPI 透传、不关心事件订阅的场景。
+[[bots]]
+id = "internal-relay"
+name = "内网反代机器人"
+app_id = "1020304077"
+app_secret = "REPLACE-WITH-CLIENT-SECRET"
+api_base = "https://bot-proxy.internal.example.com"   # 覆盖 OpenAPI base；须
+                                            #   http(s)://host；省略 = 按 sandbox
+                                            #   取平台常量
+# event_url 不写 = 事件计错误并丢弃（不投递）
+enabled = true
+
+# ── 临时停用（enabled = false）：透传 503、回调 404（回调地址从此「摘除」，
+#    平台侧重试不会继续打——ADR-Q8）、不 spawn WS supervisor。配合 PUT
+#    触发，不必删条目：
+#
+# [[bots]]
+# id = "temporarily-off"
+# name = "临时停用"
+# app_id = "1020304088"
+# app_secret = "REPLACE-WITH-CLIENT-SECRET"
+# event_url = "http://127.0.0.1:9000/qq/events"
+# enabled = false

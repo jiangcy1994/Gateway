@@ -2,7 +2,7 @@
 
 > **SDD 第 3 步**：核心类型与不变式。依赖第 2 步的模块划分——类型绝不超出架构边界。
 
-数据模型分三层：**配置值对象**（`Protocol` / `Provider` / `ProviderPatch`）、**运行期状态**（`ProviderTable` / `QuotaTracker` / `TailBuffer`）、**观测快照**（`QuotaSnapshot`）。
+数据模型分三层：**配置值对象**（`Protocol` / `Model` / `Provider` / `ProviderPatch` / `App` / `AppPatch`）、**运行期状态**（`ProviderTable` / `AppTable` / `QuotaTracker` / `TailBuffer`）、**观测快照**（`QuotaSnapshot`）。
 
 ## 核心枚举：`Protocol`（provider.rs）
 
@@ -18,6 +18,20 @@ enum Protocol { Openai, Anthropic, Systemone }
 
 `/llm/v1/{端点}` 的端点首段 → `Protocol` 的闭表推断（ADR-L12）。输入先转 ASCII 小写；`messages`/`complete` → anthropic，`chat`/`completions`/`responses`/`embeddings`/`moderations`/`audio`/`images`/`fine_tuning`/`batches`/`uploads`/`threads`/`assistants` → openai，`models`/`files` → `Err(Ambiguous)`，其余 → `Err(Unknown)`。闭表封闭：新端点必须显式登记，不允许前缀/模糊匹配。
 
+## 核心值对象：`Model`（provider.rs）
+
+一个供应商对外提供的一个**网关侧模型名**。`model` 字段在请求 body 里出现时即按此表解析。
+
+| 字段 | 类型 | 约束 |
+|---|---|---|
+| `name` | `String` | 网关模型名（app 组合里写它）；非空；**provider 内唯一** |
+| `upstream` | `Option<String>` | 上游真实模型名；缺省 = `name`；给值时非空 |
+| `priority` | `i32` | 越大越优先；默认 0；由 balancer 分层使用（ADR-L16） |
+
+- serde 默认值：`upstream` / `priority` 均可省略（`#[serde(default)]`）。
+- **不变式 P7**：`Model.name` 非空且在**同一 provider 的 models 表内唯一**（`Provider::validate`）。跨供应商可以同名（两个供应商都声明 `chat-pro` 是常态，正是分层的意义）。
+- **不变式 P8**：`Model.upstream` 为 `Some` 时非空（`Provider::validate`）。
+
 ## 核心值对象：`Provider`（provider.rs）
 
 一个 LLM 供应商。同时是 TOML 文件、管理 API、内存表的共享表示（与 `Route` 同构的共享表示原则）。
@@ -31,6 +45,8 @@ enum Protocol { Openai, Anthropic, Systemone }
 | `api_key` | `String` | 非空（网关按协议注入到上游请求，客户端的凭证一律被替换） |
 | `rpm_limit` | `Option<u64>` | `Some(n)` 时 `n > 0`；`None` = 不限 RPM |
 | `tpm_limit` | `Option<u64>` | 同上 |
+| `models` | `Vec<Model>` | 默认空表；**空表 = 协议级兜底**：参与任意 model 请求的选择、不改写 `model` 字段，effective priority = `i32::MIN`（ADR-L14） |
+| `timeout_secs` | `Option<u64>` | `Some(n)` 时 `n > 0`；缺省 = 回落 `GATEWAY_DEFAULT_TIMEOUT`（ADR-L17） |
 | `enabled` | `bool` | 默认 `true`；`false` 时**该供应商**被选择排除（协议池全禁 → 503） |
 
 ### 不变式
@@ -43,6 +59,34 @@ enum Protocol { Openai, Anthropic, Systemone }
 | P4 | 限额 `Some(n)` → `n > 0` | `Provider::validate` |
 | P5 | 限额是**供应商级**的：`rpm_limit` / `tpm_limit` 描述该供应商名下所有模型共享的上限，计数不按 model 分桶 | 结构本身（`Provider` 无 model 字段） |
 | P6 | `protocols` 非空且无重复；一个供应商说多个协议时同时进入多个协议池，限额**按供应商记一份**（跨协议共用） | `Provider::validate` + tracker 按 provider id 存放（P5 的自然推论） |
+| P7 | `Model.name` 非空且在同一 provider 的 `models` 表内唯一 | `Provider::validate` |
+| P8 | `Model.upstream` 为 `Some` 时非空 | `Provider::validate` |
+| P9 | 空模型表 = 协议级兜底（effective priority = `i32::MIN`，不改写 body）；模型表与限额正交——限额仍按供应商记一份（P5 不因模型表改变） | 结构本身 + balancer 的分层规则 |
+| P10 | `timeout_secs` 为 `Some(n)` 时 `n > 0` | `Provider::validate` |
+
+## 核心值对象：`App`（app.rs）
+
+一个**调用方应用**：以入站凭证（`Bearer` / `x-api-key`）识别，限定其可用的网关模型集合。
+
+| 字段 | 类型 | 约束 |
+|---|---|---|
+| `id` | `String` | 非空；表内唯一；`PUT` 不可改；POST 省略时自动生成 UUID v4 |
+| `name` | `String` | 展示名，默认空串 |
+| `key` | `String` | 非空；表内唯一；POST 省略 → 自动生成 `sk-gw-<uuid v4 simple>` |
+| `models` | `Vec<String>` | 允许的**网关模型名**；空表 = 不限制（默认策略） |
+| `enabled` | `bool` | 默认 `true`；`false` → 命中该 app 的请求 403 |
+
+不变式：
+
+| # | 不变式 | 由谁保证 |
+|---|---|---|
+| P11 | `App.key` 非空且在同一 `AppTable` 内唯一 | `AppTable::add`/`replace`（写锁内检查） |
+| P12 | `App.id` 在表内唯一 | `AppTable::add`/`replace` |
+| P13 | `models` 引用的是**网关模型名**（provider 声明的 `Model.name`）；表内不做外键校验——组合允许引用尚无供应商声明的模型（供应商下线不应让 app 配置失效） | 结构本身（约定） |
+
+> key 比较必须走**常量时间**（复用 `admin.rs` 的 `constant_time_eq`），避免按响应时序泄露 key 前缀。
+
+> `App.models` 为空 = 不限制：无凭证（app = None）的请求与此形态语义一致，即默认策略 = 全部已映射模型（ADR-L15）。
 
 > 与 `Route` 同宽容策略：`load_providers` 从磁盘读到重复 id 时只告警并全部保留。
 > 字段兼容（ADR-L13）：磁盘上的旧文件若写 `protocol = "openai"` 单值仍能读入（serde alias），下一次原子写回即迁移为 `protocols = [...]`；两个键都没有则解析失败（保持缺字段的大错行为）。
@@ -55,7 +99,15 @@ enum Protocol { Openai, Anthropic, Systemone }
 ProviderTable { providers: Arc<RwLock<Vec<Provider>>> }
 ```
 
-线性表（与 `RouteTable` 同构）。`list_enabled_by_protocol(protocol)` 是转发热路径的入口。
+线性表（与 `RouteTable` 同构）。`list_enabled_by_protocol(protocol)` 仍是无 model 请求的入口；带 model 的请求走 `pool_for(protocol, model)`（见 `interfaces.md`）。
+
+### `AppTable`（app.rs）
+
+```rust
+AppTable { apps: Arc<RwLock<Vec<App>>> }
+```
+
+线性表（与 `ProviderTable` 同构）。`find_by_key(key)` 是转发热路径的入口（常量时间比较）；CRUD 方法镜像 `ProviderTable`。
 
 ### `QuotaTracker`（quota.rs）
 
@@ -110,19 +162,53 @@ api_key = "sk-..."
 rpm_limit = 500
 tpm_limit = 150000
 enabled = true
+
+  [[providers.models]]
+  name = "chat-pro"
+  upstream = "chat-pro-2026-04"
+  priority = 10
+
+  [[providers.models]]
+  name = "chat-max"      # upstream 缺省 = name；priority 缺省 = 0
 ```
 
 `ProvidersFile { providers: Vec<Provider> }` → `toml::to_string_pretty`；原子替换语义与 routes 文件相同（同目录临时文件 + rename，重写丢注释）。`api_key` 以明文落盘——与 `Route.headers` 注入密钥的处理一致（ADR-L11）。
+
+## 持久化形态（apps.toml，ADR-L18）
+
+```toml
+# top-gateway apps - managed file, rewrites drop comments
+[[apps]]
+id = "cli-code"
+name = "Claude Code CLI"
+key = "sk-gw-cli-code-xxxx"
+models = ["chat-pro", "chat-max"]
+enabled = true
+
+[[apps]]
+id = "cherry-studio"
+models = []            # 空表 = 不限制（默认策略）
+```
+
+`AppsFile { apps: Vec<App> }`；缺文件非致命、原子写、重写丢注释——与 providers 文件完全同构。
 
 ## 数据流上的形态
 
 ```
 providers.toml ──load_providers──→ Vec<Provider> ──set_all──→ ProviderTable
                                         ▲                        │
-                                        │                        ├─ list_enabled_by_protocol → balancer
-                                        │                        ├─ add/replace/remove ← /__admin/llm
+                                        │                        ├─ list_enabled_by_protocol → balancer（无 model 请求）
+                                        │                        ├─ pool_for(protocol, model) → balancer（带 model 请求）
+                                        │                        ├─ add/replace/remove ← /__admin/llm/providers
                                         │                        └──── save_providers（原子写回）──┘
                                         │
+apps.toml ──load_apps──→ Vec<App> ──set_all──→ AppTable
+                                  ▲              │
+                                  │              ├─ find_by_key → forward（入站凭证）
+                                  │              ├─ add/replace/remove ← /__admin/llm/apps
+                                  │              └──── save_apps（原子写回）──┘
+                                  │
+请求 body（≤16MiB）→ 取 model → app 组合校验 → balancer → 改写 model → 上游
 选择/派遣 ──同一临界区──→ QuotaTracker.requests（RPM 计数）
 响应流 tap ──TailBuffer→ extract_tokens ──→ QuotaTracker.tokens（TPM 记账）
 QuotaTracker / RouteStats ──快照──→ /__admin/llm/quota · /__admin/llm/metrics

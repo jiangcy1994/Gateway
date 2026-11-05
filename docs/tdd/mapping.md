@@ -1,6 +1,8 @@
 # 测试与需求映射
 
 > 每个测试钉住一条 `docs/sdd/` 里的规格条目。新增测试前先在规格里登记它要钉的行为，再在此登记映射。
+>
+> 例外：`llm_example_configs_parse_and_validate`（LLM 表末行）与 `qqbot_example_configs_parse_and_validate`（QQ Bot 表末行）是示例配置维护条目——钉的是 `examples/` 三个模板不随代码演进腐坏，不对应 SDD 规格。
 
 ## top-gateway（`tests/integration.rs`）
 
@@ -59,6 +61,24 @@
 | `llm_admin_rejects_invalid_provider` | `Provider::validate` 后置 + `llm/admin` 端点表 | 非法 base_url → 400；`protocols` 空 / 重复 → 400；JSON 缺必填字段 → 422（axum 标准行为，与路由 API 一致） |
 | `llm_metrics_view_reports_per_provider_stats` | `llm/admin` 指标端点 | 按供应商的请求数 / 并发 / 错误 / 延迟 |
 | `llm_coexists_with_route_table` | `llm/lib` 集成契约 | `/llm/*` 与 `routes.toml` 前缀路由共存互不影响 |
+| `llm_rewrites_model_to_upstream_name` | ADR-L14（模型映射改写）+ `llm/forward` 后置第 8 步 | 两供应商声明同一网关 model、不同 upstream 名与 priority → mock 上游收到的是重写后的 upstream 名；响应 `x-llm-provider` 指向高优先级者 |
+| `llm_model_rewrite_zero_diff_passthrough` | ADR-L14（值相同时零差异透传） | upstream 与请求 model 相同时，上游收到的 body 与客户端发送的逐字节一致（不重序列化） |
+| `llm_priority_tier_demotes_on_exhaustion` | ADR-L16（分层选择）+ `select_and_record` 后置 | 高优先级供应商 `rpm_limit=1` 耗尽后，第二次请求降层到低优先级供应商（断言 `x-llm-provider`） |
+| `llm_unknown_model_returns_404` | `llm/forward` 后置第 5 步（`ModelNotFound`） | 无任何供应商声明的 model → 404，消息提示模型表位置 |
+| `llm_model_all_disabled_returns_503` | `llm/forward` 后置第 5 步（`NoProviderForModel`） | 模型有声明但池空（disabled / 协议不匹配）→ 503 |
+| `llm_all_tiers_exhausted_returns_429` | `llm/forward` 后置第 5 步（分层 429） | 所有层 weight 全 0 → 429，house 错误体含 model |
+| `llm_model_request_skips_empty_models_provider` | ADR-L14 显式声明优先于兜底 | 并存空模型表 provider 与声明该 model 的 provider 时，声明者被优先选中 |
+| `llm_catchall_provider_passes_model_through` | ADR-L14 空表兜底 | 只有空模型表 provider 时，带 model 的请求 model 原样透传、路由命中 |
+| `llm_app_combo_allows_models_without_model_field` | ADR-L15（组合盲区）+ 风险 R11 | app 组合非空但请求 body 无 `model` 字段 → 放行（不拦截） |
+| `llm_app_rejects_model_outside_combo` | `llm/forward` 后置第 4 步（`ModelNotAllowedForApp`） | 组合外 model → 403，消息含 model 与 app id |
+| `llm_unknown_app_key_returns_401` | `llm/forward` 后置第 2 步（`UnknownAppKey`） | 无效凭证 → 401；去掉凭证后同一请求放行 |
+| `llm_disabled_app_key_returns_403` | `llm/forward` 后置第 2 步（`AppDisabled`） | 命中但 `enabled=false` 的 app key → 403 |
+| `llm_request_without_credential_uses_default_policy` | ADR-L15 默认策略 | 无凭证请求按全部已映射模型放行（历史 3 处 `Bearer client-key` 站点改无头后的回归基线） |
+| `llm_oversized_body_returns_413` | `llm/forward` 前置常量（`MAX_REQUEST_BODY`）+ 风险 R12 | 超过 16 MiB 的请求 body → 413，不转发 |
+| `llm_provider_timeout_overrides_global` | ADR-L17 | provider `timeout_secs=1` 指向 sleep 3s 的慢上游 → 504；不设 timeout → 走全局默认（此用例不被超时误杀） |
+| `llm_admin_app_crud_and_persistence` | `llm/admin` apps 端点表 + `config.rs` 持久化 | app CRUD、合并式 PUT（models 列表替换）、key 自动生成 `sk-gw-...`、`apps.toml` 原子写回（重读断言落盘） |
+| `llm_legacy_provider_without_models_still_works` | ADR-L14 兜底兼容契约 | 无模型表的历史 provider 配置（`provider()` helper）在带 model 的请求下仍可路由——向后兼容回归 |
+| `llm_example_configs_parse_and_validate` | 示例配置维护条目（非 SDD 契约，见 `examples/README.md`） | `examples/` 两个 LLM 示例 TOML 经真实 `load_providers`/`load_apps` 解析与 `validate` 通过；分层（priority 10/1）、按供应商超时、组合引用已声明模型的演示不变式成立——防示例文档随代码演进腐坏 |
 
 ## QQ Bot 子网关（`tests/qqbot_gateway.rs`）
 
@@ -80,3 +100,4 @@
 | `ws_supervisor_identifies_heartbeats_and_delivers` | supervisor 第 3/4/5 步 | Hello → Identify（`token: "QQBot <token>"` / intents / shard）→ READY 存 session → 心跳 op 1（`d` = 最新 seq，首拍 null）→ op 11 ack；op 0 事件异步投递到 event_url |
 | `ws_supervisor_stops_on_unretryable_close` | supervisor 第 6 步关闭码分流 | 4014 类不可重试码 → 停止不重连：等待后连接数不增、无 op 6 Resume 帧 |
 | `ws_supervisor_resumes_session_after_abrupt_drop` | supervisor 第 4/5 步（Resume 分支） | 断线后重连发 op 6（带 session_id + seq），收到 `RESUMED`，session 跨重连不丢失 |
+| `qqbot_example_configs_parse_and_validate` | 示例配置维护条目（非 SDD 契约，见 `examples/README.md`） | `examples/bots.example.toml` 经真实 `load_bots` 解析与 `validate` 通过；两通道形态（webhook/websocket）、沙箱切换、api_base 覆盖、无 event_url 丢弃分支的演示不变式成立，且占位凭证保持占位形态——防示例文档随代码演进腐坏 |

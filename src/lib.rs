@@ -67,6 +67,7 @@ pub async fn run_with_shutdown(
     let routes_path = settings.routes_file.clone();
     let providers_path = settings.providers_file.clone();
     let bots_path = settings.bots_file.clone();
+    let apps_path = settings.apps_file.clone();
 
     let state = AppState::new(settings)?;
     let routes = config::load_routes(&routes_path)
@@ -93,6 +94,12 @@ pub async fn run_with_shutdown(
     let count = bots.len();
     state.bots.set_all(bots);
     tracing::info!("loaded {count} bot(s) from {}", bots_path.display());
+
+    let apps = config::load_apps(&apps_path)
+        .map_err(|e| format!("failed to load apps from {}: {e}", apps_path.display()))?;
+    let count = apps.len();
+    state.apps.set_all(apps);
+    tracing::info!("loaded {count} app(s) from {}", apps_path.display());
 
     // 启动 spawn：每个 enabled 且 websocket 形态的机器人起 WS supervisor。
     let ws_count = state
