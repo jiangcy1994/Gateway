@@ -68,6 +68,7 @@ pub async fn run_with_shutdown(
     let providers_path = settings.providers_file.clone();
     let bots_path = settings.bots_file.clone();
     let apps_path = settings.apps_file.clone();
+    let usage_path = settings.usage_file.clone();
 
     let state = AppState::new(settings)?;
     let routes = config::load_routes(&routes_path)
@@ -101,6 +102,14 @@ pub async fn run_with_shutdown(
     state.apps.set_all(apps);
     tracing::info!("loaded {count} app(s) from {}", apps_path.display());
 
+    // 用量账本（ADR-L20）：不是配置面——加载只为在重启后接着累计；行级校验
+    // （日期解析、重复行合并）在 `set_all` 里做。
+    let usage = config::load_usage(&usage_path)
+        .map_err(|e| format!("failed to load usage from {}: {e}", usage_path.display()))?;
+    let count = usage.len();
+    state.llm_usage.set_all(usage);
+    tracing::info!("loaded {count} usage row(s) from {}", usage_path.display());
+
     // 启动 spawn：每个 enabled 且 websocket 形态的机器人起 WS supervisor。
     let ws_count = state
         .bots
@@ -113,8 +122,9 @@ pub async fn run_with_shutdown(
     }
 
     health::spawn(state.clone());
+    llm::ledger::spawn_flush(state.clone());
 
-    let app = build_app(state);
+    let app = build_app(state.clone());
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     let addr = listener.local_addr()?;
     tracing::info!("top-gateway {VERSION} listening on http://{addr}");
@@ -126,6 +136,12 @@ pub async fn run_with_shutdown(
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await?;
+
+    // 末次 flush（ADR-L21）：graceful 排空之后把在途窗口内的记账落盘。失败
+    // 只告警——统计 loses 一个窗口，不影响配额与转发（R15）。
+    if let Err(e) = state.llm_usage.flush_if_dirty(&state.settings.usage_file) {
+        tracing::error!("final usage ledger flush failed: {e}");
+    }
 
     tracing::info!("shutdown complete");
     Ok(())

@@ -26,6 +26,8 @@ cargo fmt && cargo clippy --all-targets
 | `GATEWAY_ROUTES_FILE` | `routes.toml` | 路由配置文件 |
 | `GATEWAY_PROVIDERS_FILE` | `providers.toml` | LLM 供应商配置文件 |
 | `GATEWAY_APPS_FILE` | `apps.toml` | LLM 应用（模型组合）配置文件 |
+| `GATEWAY_USAGE_FILE` | `usage.toml` | LLM 用量账本文件（按日 × 应用，自动写回） |
+| `GATEWAY_USAGE_FLUSH_SECS` | `60` | 用量账本周期写盘间隔（`0` = 仅 shutdown 写盘） |
 | `GATEWAY_BOTS_FILE` | `bots.toml` | QQ 机器人配置文件 |
 | `GATEWAY_HEALTH_INTERVAL_SECS` | `10` | 健康检查轮询间隔 |
 | `GATEWAY_HEALTH_TIMEOUT_SECS` | `2` | 单次健康探测超时 |
@@ -196,6 +198,7 @@ LLM 管理端点（同样需要 `X-Admin-Key`）：
 | GET | `/__admin/llm/apps` | 列出全部应用（含 key） |
 | POST | `/__admin/llm/apps` | 新增应用；`id`/`key` 省略时生成 |
 | GET/PUT/DELETE | `/__admin/llm/apps/{id}` | 查看 / 合并式更新 / 删除 |
+| GET | `/__admin/llm/usage` | 按日 × 应用的分桶 token 用量（见下） |
 | GET | `/__admin/llm/quota` | 各供应商窗口内 RPM/TPM 用量与余量 |
 | GET | `/__admin/llm/metrics` | 各供应商请求数 / 并发 / 错误数 / 平均延迟 |
 
@@ -205,6 +208,24 @@ LLM 管理端点（同样需要 `X-Admin-Key`）：
 （`QuotaExhausted`）；不带 `model` 时维持原语义——协议下无启用供应商 → `503`。
 `/llm/v1` 下两协议共用或未登记的端点 → `404`。TPM 由响应尾包里的 `usage`
 字段事后计量（非流式取 JSON，流式取末尾 `data:` 块），解析不到时记 0，永不失败。
+
+**用量统计**（`/__admin/llm/usage`）：每次响应记账时把 usage 按 **UTC 日期 × 应用**
+记入账本，无凭证请求以 `app: null` 单列；token 按类型分桶，跨协议对齐：
+
+| 桶 | openai 来源 | anthropic 来源 |
+|---|---|---|
+| `input` | `prompt_tokens - prompt_tokens_details.cached_tokens` | `input_tokens` |
+| `output` | `completion_tokens` | `output_tokens` |
+| `cache_read` | `prompt_tokens_details.cached_tokens` | `cache_read_input_tokens` |
+| `cache_write` | （无，恒 0） | `cache_creation_input_tokens` |
+
+查询参数全部可选：`app`（精确匹配应用 id）、`date`（单日）、`from` / `to`
+（闭区间，格式 `YYYY-MM-DD`，非法返回 400）。返回按 `(date, app)` 升序：
+`[{"date":"2026-11-06","app":"cli-code","input":12340,"output":890,
+"cache_read":2100,"cache_write":0,"total":15330}, ...]`。账本周期写回
+`GATEWAY_USAGE_FILE`（默认 `usage.toml`，全量原子写），正常关停时落盘一次，
+重启后恢复；进程被强杀会丢失最近一个 flush 窗口的统计（风险 R15）——统计数据
+不影响配额与转发。
 
 ## QQ Bot 网关（`/qqbot/*`）
 
@@ -268,7 +289,9 @@ QQ Bot 管理端点（同样需要 `X-Admin-Key`）：
 
 每次经管理 API 的路由 / 供应商 / 应用 / 机器人变更都会原子写回对应文件
 （`routes.toml` / `providers.toml` / `apps.toml` / `bots.toml`，临时文件 +
-rename），重启不丢失；注意重写会丢弃文件里的注释。
+rename），重启不丢失；注意重写会丢弃文件里的注释。LLM 用量账本
+（`usage.toml`）由网关自己周期写回（默认 60s，`GATEWAY_USAGE_FLUSH_SECS`
+可调），不是配置文件，管理 API 不写它——手工编辑会被下次落盘覆盖。
 
 ## 部署为 Windows 服务
 
@@ -295,6 +318,7 @@ rename），重启不丢失；注意重写会丢弃文件里的注释。
   ├─ providers.toml
   ├─ apps.toml
   ├─ bots.toml
+  ├─ usage.toml          # LLM 用量账本（网关自动写回；install 时不存在属正常）
   ├─ gateway.env       # KEY=VALUE，服务进程的唯一环境来源（install 时生成模板）
   └─ top-gateway.log.YYYY-MM-DD   # 按日滚动（当前文件即带日期后缀）
 ```

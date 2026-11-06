@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 use crate::llm::app::{App, AppsFile};
+use crate::llm::ledger::UsageEntry;
 use crate::llm::provider::{Provider, ProvidersFile};
 use crate::qqbot::bot::{Bot, BotsFile};
 use crate::router::Route;
@@ -27,6 +28,11 @@ pub struct Settings {
     pub bots_file: std::path::PathBuf,
     /// Path of the TOML file holding the LLM apps（ADR-L18：独立配置面）。
     pub apps_file: std::path::PathBuf,
+    /// Path of the TOML file holding the LLM usage ledger（ADR-L20；不是配置
+    /// 文件——由网关周期写回，管理 API 不写它）。
+    pub usage_file: std::path::PathBuf,
+    /// 用量账本周期 flush 间隔秒数（`0` = 仅 shutdown 写盘，ADR-L21）。
+    pub usage_flush_secs: u64,
     /// Interval between background health checks of every enabled route.
     pub health_interval_secs: u64,
     /// Per-request timeout for a single health probe.
@@ -109,6 +115,8 @@ impl Settings {
             providers_file: resolve_path("GATEWAY_PROVIDERS_FILE", "providers.toml", &base),
             bots_file: resolve_path("GATEWAY_BOTS_FILE", "bots.toml", &base),
             apps_file: resolve_path("GATEWAY_APPS_FILE", "apps.toml", &base),
+            usage_file: resolve_path("GATEWAY_USAGE_FILE", "usage.toml", &base),
+            usage_flush_secs: env_u64_or_zero("GATEWAY_USAGE_FLUSH_SECS", 60),
             health_interval_secs: env_u64("GATEWAY_HEALTH_INTERVAL_SECS", 10),
             health_timeout_secs: env_u64("GATEWAY_HEALTH_TIMEOUT_SECS", 2),
             default_timeout_secs: env_u64("GATEWAY_DEFAULT_TIMEOUT_SECS", 30),
@@ -121,6 +129,15 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|v: &u64| *v > 0)
+        .unwrap_or(default)
+}
+
+/// 与 `env_u64` 同语义，但保留显式的 `0`（usage flush：`0` 是有效值，
+/// 表示「仅 shutdown 写盘」，不能被过滤成默认值）。
+fn env_u64_or_zero(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
         .unwrap_or(default)
 }
 
@@ -326,6 +343,64 @@ pub fn save_apps(path: &std::path::Path, apps: &[App]) -> Result<(), ApiError> {
     })
     .map_err(|e| ApiError::Persist(format!("serialize apps: {e}")))?;
     let body = format!("# top-gateway apps - managed file, rewrites drop comments\n{text}");
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .map_err(|e| ApiError::Persist(format!("create temp file in {}: {e}", dir.display())))?;
+    use std::io::Write;
+    tmp.write_all(body.as_bytes())
+        .map_err(|e| ApiError::Persist(format!("write temp file: {e}")))?;
+    tmp.persist(path)
+        .map_err(|e| ApiError::Persist(format!("replace {}: {e}", path.display())))?;
+    Ok(())
+}
+
+/// On-disk layout of the usage ledger: one `[[usage]]` row per (date, app)。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UsageFile {
+    #[serde(default)]
+    pub usage: Vec<UsageEntry>,
+}
+
+/// Loads the usage ledger from the TOML file. A missing file is not an error:
+/// startup proceeds with an empty ledger（与 `load_routes` 等同策略，ADR-L20）。
+/// 行级校验（日期解析、重复行合并）不在这一步，交给 `UsageLedger::set_all`。
+pub fn load_usage(path: &std::path::Path) -> Result<Vec<UsageEntry>, ApiError> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let file: UsageFile = toml::from_str(&text)
+                .map_err(|e| ApiError::ConfigLoad(format!("{}: {e}", path.display())))?;
+            Ok(file.usage)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                "usage file {} not found; starting with an empty ledger",
+                path.display()
+            );
+            Ok(Vec::new())
+        }
+        Err(e) => Err(ApiError::ConfigLoad(format!("{}: {e}", path.display()))),
+    }
+}
+
+/// 全量写回用量账本（与 `save_apps` 同策略：同目录临时文件 + rename，托管头）。
+/// 无凭证条目落 `app = ""`（`Option::None` 在 TOML 里是不含该键）；`total`
+/// 由四桶重算后落盘，加载时忽略。
+pub fn save_usage(path: &std::path::Path, entries: &[UsageEntry]) -> Result<(), ApiError> {
+    let rows: Vec<UsageEntry> = entries
+        .iter()
+        .map(|entry| UsageEntry {
+            date: entry.date.clone(),
+            app: Some(entry.app.clone().unwrap_or_default()),
+            input: entry.input,
+            output: entry.output,
+            cache_read: entry.cache_read,
+            cache_write: entry.cache_write,
+            total: entry.input + entry.output + entry.cache_read + entry.cache_write,
+        })
+        .collect();
+    let text = toml::to_string_pretty(&UsageFile { usage: rows })
+        .map_err(|e| ApiError::Persist(format!("serialize usage: {e}")))?;
+    let body = format!("# top-gateway usage - managed file, rewrites drop comments\n{text}");
     let dir = path.parent().unwrap_or(std::path::Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir)
         .map_err(|e| ApiError::Persist(format!("create temp file in {}: {e}", dir.display())))?;

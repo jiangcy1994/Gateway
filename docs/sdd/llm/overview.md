@@ -47,9 +47,10 @@ top-gateway:8000
 - **应用组合**（ADR-L15）：入站 `Authorization: Bearer <k>` 或 `x-api-key: <k>` 即应用凭证（客户端把 app key 填在 SDK 原本填供应商 key 的位置）。无凭证 → 默认策略 = 全部已映射模型（继续放行）；凭证命中 app 且其 `models` 非空时，请求 model 不在组合内 → `403`；凭证未命中任何 app → `401`；命中的 app 被禁用 → `403`。
 - 配额全部耗尽 → `429`；该协议一个供应商都没配 → `503`；请求带模型时：无任何供应商声明该模型 → `404`，模型有声明但池空（全禁 / 协议不匹配）→ `503`；未知协议段 → `404`；v1 推断失败（两协议共用的端点 / 未知端点 / v1 后无端点）→ `404` 并提示改用显式协议段。
 - **按供应商超时**（ADR-L17）：provider 可设 `timeout_secs`（缺省回落 `GATEWAY_DEFAULT_TIMEOUT`）。
+- **按日 × 应用的用量账本**（ADR-L20）：响应记账时把 usage 按四桶（`input` / `output` / `cache_read` / `cache_write`，跨协议对齐）记入 `UsageLedger`，主键为 **(UTC 日期, app id)**；无凭证流量也入账（app = null）；`GET /__admin/llm/usage` 按 `app` / `date` / `from` / `to` 过滤查询；累计数据周期 flush 到 `GATEWAY_USAGE_FILE`（默认 `usage.toml`），重启恢复。
 - **按供应商 HTTP 代理**（ADR-L19）：provider 可设 `proxy_url`（缺省 = 共享直连 client，与全局行为一致）。配了代理的供应商经**按代理 url 复用的 reqwest client**（自带连接池）转发；HTTP 与 HTTPS 代理均支持（HTTPS 目标走 CONNECT 隧道），socks5 不支持并由 `validate` 拒绝。代理不可达与上游不可达同处理（502）。
-- 供应商 CRUD 管理 API（`/__admin/llm/providers*`，与路由 CRUD 同构、合并式更新）+ 应用 CRUD（`/__admin/llm/apps*`，同构）+ 配额查看（`/__admin/llm/quota`）+ 指标（`/__admin/llm/metrics`，复用 `RouteStats`）。
-- 供应商配置原子持久化到 `GATEWAY_PROVIDERS_FILE`（默认 `providers.toml`）、应用到 `GATEWAY_APPS_FILE`（默认 `apps.toml`），重启不丢失。
+- 供应商 CRUD 管理 API（`/__admin/llm/providers*`，与路由 CRUD 同构、合并式更新）+ 应用 CRUD（`/__admin/llm/apps*`，同构）+ 配额查看（`/__admin/llm/quota`）+ 指标（`/__admin/llm/metrics`，复用 `RouteStats`）+ 用量查询（`/__admin/llm/usage`，只读、按日 × 应用 × token 类型，ADR-L20）。
+- 供应商配置原子持久化到 `GATEWAY_PROVIDERS_FILE`（默认 `providers.toml`）、应用到 `GATEWAY_APPS_FILE`（默认 `apps.toml`）、用量账本持久化到 `GATEWAY_USAGE_FILE`（默认 `usage.toml`，周期 flush + shutdown flush，ADR-L20/L21），重启不丢失。
 - 供应商凭证按协议注入（OpenAI/SystemOne → `Authorization: Bearer`；Anthropic → `x-api-key` + 缺省 `anthropic-version`）。
 
 ## 范围外
@@ -70,7 +71,7 @@ top-gateway:8000
 |---|---|
 | LLM 应用 / 本地工具 | OpenAI / Anthropic SDK 指向 `http://gw:8000/llm/v1`，`api_key` 填**应用 key**（`POST /__admin/llm/apps` 生成）；网关按端点推断协议、按 app 的模型组合放行、把 `model` 改写为选中供应商的上游名。需要无歧义场景改指 `http://gw:8000/llm/{openai\|anthropic}` |
 | 服务运维 | `POST /__admin/llm/providers` 登记供应商（base_url、key、协议、模型表、rpm/tpm 限额、timeout），立即生效；`POST /__admin/llm/apps` 给每个本地 app 发 key 并圈定可用模型；`GET /__admin/llm/quota` 看各供应商分钟级余量 |
-| 监控 | 轮询 `GET /__admin/llm/metrics`（按供应商的请求数 / 并发 / 错误 / 平均延迟）与 `GET /__admin/llm/quota` |
+| 监控 | 轮询 `GET /__admin/llm/metrics`（按供应商的请求数 / 并发 / 错误 / 平均延迟）与 `GET /__admin/llm/quota`；按日拉 `GET /__admin/llm/usage?from=...&to=...`（或 `?app=<id>`）做各应用的分桶 token 用量对账 |
 
 ## 非功能约束
 

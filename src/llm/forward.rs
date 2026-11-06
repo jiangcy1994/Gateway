@@ -6,14 +6,16 @@ use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
+use chrono::Utc;
 use futures_util::{Stream, StreamExt};
 
 use crate::error::ApiError;
 use crate::llm::app;
 use crate::llm::balancer;
+use crate::llm::ledger::UsageLedger;
 use crate::llm::provider::{infer_protocol, InferError, Protocol};
 use crate::llm::quota::QuotaTracker;
-use crate::llm::usage::{extract_tokens, TailBuffer};
+use crate::llm::usage::{extract_tokens, extract_usage, TailBuffer};
 use crate::proxy::{error_response, is_filtered};
 use crate::state::AppState;
 
@@ -26,7 +28,7 @@ pub const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
 
 /// `/llm` nest 的 fallback 处理器：剥前缀 → 解析 app → 缓冲 body 取 model →
 /// 组合校验 → 分层选供应商 → 按需改写 model → 注入凭证 → 透传（响应流式）
-/// → 尾包提取 usage 记 TPM。
+/// → 尾包提取 usage：先记 TPM 配额，再记按日 × app 账本（ADR-L20）。
 pub async fn forward(
     State(state): State<AppState>,
     method: Method,
@@ -301,6 +303,8 @@ pub async fn forward(
         protocol,
         content_type,
         quota: Some(quota),
+        ledger: Some(state.llm_usage.clone()),
+        app_id: app.as_ref().map(|app| app.id.clone()),
         tail: TailBuffer::new(),
         done: false,
     };
@@ -336,13 +340,16 @@ async fn read_request_body(request: Request) -> Result<Bytes, BodyReadError> {
 }
 
 /// 响应流 tap：每块向客户端转发的同时复制进 `TailBuffer`；流正常结束 /
-/// 上游流出错 / 消费者断开（Drop）三种情形都触发一次
-/// `extract_tokens → record_tokens`（互斥，只记一次）。
+/// 上游流出错 / 消费者断开（Drop）三种情形都互斥地触发一次记账（`done`
+/// 保证只记一次）：先 `extract_tokens → record_tokens`（TPM 配额），再
+/// `extract_usage → ledger.record(app_id, 当日 UTC, 分桶)`（ADR-L20）。
 struct UsageTap<S> {
     upstream: Pin<Box<S>>,
     protocol: Protocol,
     content_type: Option<String>,
     quota: Option<std::sync::Arc<QuotaTracker>>,
+    ledger: Option<UsageLedger>,
+    app_id: Option<String>,
     tail: TailBuffer,
     done: bool,
 }
@@ -353,13 +360,16 @@ impl<S> UsageTap<S> {
             return;
         }
         self.done = true;
+        let tail = self.tail.tail();
         if let Some(quota) = self.quota.take() {
-            let tokens = extract_tokens(
-                self.protocol,
-                self.content_type.as_deref(),
-                self.tail.tail(),
-            );
+            let tokens = extract_tokens(self.protocol, self.content_type.as_deref(), tail);
             quota.record_tokens(tokens);
+        }
+        // 账本路径与配额路径完全独立（ADR-L20）：`record` 不可失败，也不持
+        // 任何 `QuotaTracker` 的锁——两路径 worst case 互不影响。
+        if let Some(ledger) = self.ledger.take() {
+            let usage = extract_usage(self.protocol, self.content_type.as_deref(), tail);
+            ledger.record(self.app_id.as_deref(), Utc::now().date_naive(), usage);
         }
     }
 }

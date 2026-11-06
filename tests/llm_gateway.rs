@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 use top_gateway::build_app;
 use top_gateway::config::{self, Settings};
+use top_gateway::llm::ledger::{UsageFilter, UsageLedger};
 use top_gateway::llm::provider::{Model, Protocol, Provider};
 use top_gateway::state::AppState;
 
@@ -26,9 +27,13 @@ const ADMIN_KEY: &str = "test-admin-key";
 
 struct LlmGateway {
     addr: SocketAddr,
+    /// 网关 state 的克隆：usage 测试直接调 `state.llm_usage.flush_if_dirty`
+    /// 钉死落盘，不依赖周期任务的时间窗口（测试里 `usage_flush_secs = 0`）。
+    state: AppState,
     _dir: TempDir,
     providers_path: PathBuf,
     apps_path: PathBuf,
+    usage_path: PathBuf,
 }
 
 fn provider(id: &str, protocol: Protocol, base_url: &str) -> Provider {
@@ -64,7 +69,12 @@ fn multi_protocol_provider(id: &str, base_url: &str) -> Provider {
     }
 }
 
-fn llm_settings(routes_path: PathBuf, providers_path: PathBuf, apps_path: PathBuf) -> Settings {
+fn llm_settings(
+    routes_path: PathBuf,
+    providers_path: PathBuf,
+    apps_path: PathBuf,
+    usage_path: PathBuf,
+) -> Settings {
     Settings {
         bind: "127.0.0.1:0".to_string(),
         admin_key: Some(ADMIN_KEY.to_string()),
@@ -72,6 +82,9 @@ fn llm_settings(routes_path: PathBuf, providers_path: PathBuf, apps_path: PathBu
         providers_file: providers_path,
         bots_file: std::path::PathBuf::from("bots.toml"),
         apps_file: apps_path,
+        usage_file: usage_path,
+        // 0 = 不起周期 flush 任务；测试落盘走 state.llm_usage.flush_if_dirty
+        usage_flush_secs: 0,
         health_interval_secs: 600,
         health_timeout_secs: 2,
         default_timeout_secs: 15,
@@ -83,9 +96,15 @@ async fn spawn_llm_gateway(providers: Vec<Provider>) -> LlmGateway {
     let routes_path = dir.path().join("routes.toml");
     let providers_path = dir.path().join("providers.toml");
     let apps_path = dir.path().join("apps.toml");
+    let usage_path = dir.path().join("usage.toml");
     config::save_routes(&routes_path, &[]).unwrap();
     config::save_providers(&providers_path, &providers).unwrap();
-    let settings = llm_settings(routes_path, providers_path.clone(), apps_path.clone());
+    let settings = llm_settings(
+        routes_path,
+        providers_path.clone(),
+        apps_path.clone(),
+        usage_path.clone(),
+    );
     let state = AppState::new(settings).unwrap();
     state
         .routes
@@ -93,7 +112,7 @@ async fn spawn_llm_gateway(providers: Vec<Provider>) -> LlmGateway {
     state
         .providers
         .set_all(config::load_providers(state.settings.providers_file.as_path()).unwrap());
-    let app = build_app(state);
+    let app = build_app(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -101,9 +120,11 @@ async fn spawn_llm_gateway(providers: Vec<Provider>) -> LlmGateway {
     });
     LlmGateway {
         addr,
+        state,
         _dir: dir,
         providers_path,
         apps_path,
+        usage_path,
     }
 }
 
@@ -157,6 +178,8 @@ async fn spawn_mock_llm() -> String {
 }
 
 /// openai：`model == "plain"` 时不带 usage（R1 场景）；`stream == true` 时返 SSE。
+/// usage 带 `prompt_tokens_details.cached_tokens`，钉住账本的 input 归一（ADR-L20：
+/// `input = prompt_tokens - cached`，TPM 仍读 `total_tokens`）。
 async fn chat_completions(
     headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
@@ -165,7 +188,7 @@ async fn chat_completions(
     let req: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
     if req.get("stream") == Some(&json!(true)) {
         let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
-                   data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n\
+                   data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\n\
                    data: [DONE]\n\n";
         return ([("content-type", "text/event-stream")], sse.to_string()).into_response();
     }
@@ -176,17 +199,22 @@ async fn chat_completions(
         "echo": header_echo(&headers),
     });
     if req.get("model").and_then(|m| m.as_str()) != Some("plain") {
-        resp["usage"] = json!({"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15});
+        resp["usage"] = json!({
+            "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
+            "prompt_tokens_details": {"cached_tokens": 4}
+        });
     }
     Json(resp).into_response()
 }
 
-/// anthropic：非流式单 usage；`stream == true` 时返 message_start/message_delta SSE。
+/// anthropic：非流式单 usage；`stream == true` 时返 message_start/message_delta
+/// SSE。usage 带 cache 字段，钉住账本的四桶映射（ADR-L20；TPM 仍只读
+/// `input_tokens` + `output_tokens`）。
 async fn messages(headers: HeaderMap, OriginalUri(uri): OriginalUri, body: Bytes) -> Response {
     let req: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
     if req.get("stream") == Some(&json!(true)) {
         let sse = "event: message_start\n\
-                   data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n\
+                   data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":1}}}\n\n\
                    event: message_delta\n\
                    data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n\n\
                    data: [DONE]\n\n";
@@ -197,7 +225,10 @@ async fn messages(headers: HeaderMap, OriginalUri(uri): OriginalUri, body: Bytes
         "type": "message",
         "path": uri.path(),
         "echo": header_echo(&headers),
-        "usage": {"input_tokens": 3, "output_tokens": 7},
+        "usage": {
+            "input_tokens": 3, "output_tokens": 7,
+            "cache_read_input_tokens": 2, "cache_creation_input_tokens": 1
+        },
     }))
     .into_response()
 }
@@ -1145,12 +1176,13 @@ async fn llm_file_level_proxy_url_routes_request_through_proxy() {
         routes_path,
         providers_path.clone(),
         dir.path().join("apps.toml"),
+        dir.path().join("usage.toml"),
     );
     let state = AppState::new(settings).unwrap();
     state
         .providers
         .set_all(config::load_providers(providers_path.as_path()).unwrap());
-    let app = build_app(state);
+    let app = build_app(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -1206,6 +1238,7 @@ async fn llm_hand_edited_invalid_proxy_loads_but_fails_at_request_time() {
         routes_path,
         providers_path.clone(),
         dir.path().join("apps.toml"),
+        dir.path().join("usage.toml"),
     );
     let state = AppState::new(settings).unwrap();
     // 启动加载接受 socks5 值（文件态优先于校验）
@@ -1213,7 +1246,7 @@ async fn llm_hand_edited_invalid_proxy_loads_but_fails_at_request_time() {
     let expected = format!("socks5://127.0.0.1:{proxy_port}");
     assert_eq!(loaded[0].proxy_url.as_deref(), Some(expected.as_str()));
     state.providers.set_all(loaded);
-    let app = build_app(state);
+    let app = build_app(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -1537,7 +1570,13 @@ async fn llm_coexists_with_route_table() {
         }],
     )
     .unwrap();
-    let settings = llm_settings(routes_path, providers_path.clone(), apps_path.clone());
+    let usage_path = dir.path().join("usage.toml");
+    let settings = llm_settings(
+        routes_path,
+        providers_path.clone(),
+        apps_path.clone(),
+        usage_path.clone(),
+    );
     let state = AppState::new(settings).unwrap();
     state
         .routes
@@ -1545,7 +1584,7 @@ async fn llm_coexists_with_route_table() {
     state
         .providers
         .set_all(config::load_providers(state.settings.providers_file.as_path()).unwrap());
-    let app = build_app(state);
+    let app = build_app(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -1553,9 +1592,11 @@ async fn llm_coexists_with_route_table() {
     });
     let gw = LlmGateway {
         addr,
+        state,
         _dir: dir,
         providers_path,
         apps_path,
+        usage_path,
     };
 
     // routes.toml 的前缀转发照常
@@ -2355,6 +2396,399 @@ async fn llm_admin_app_crud_and_persistence() {
         .map(|a| a["id"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(remaining, vec![generated_id]);
+}
+
+// ------------------------------------------- ADR-L20 按日 × 应用用量账本
+
+async fn usage_view(gw: &LlmGateway, query: &str) -> Vec<Value> {
+    let v: Value = admin_get(gw, &format!("/__admin/llm/usage{query}"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    v["usage"].as_array().cloned().unwrap()
+}
+
+fn today() -> String {
+    chrono::Utc::now().date_naive().to_string()
+}
+
+fn shift_days(days: i64) -> String {
+    (chrono::Utc::now().date_naive() + chrono::Duration::days(days)).to_string()
+}
+
+fn usage_row(rows: &[Value], app: Option<&str>) -> Value {
+    rows.iter()
+        .find(|row| match app {
+            Some(app) => row["app"].as_str() == Some(app),
+            None => row["app"].is_null(),
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("usage row for app {app:?} not found in {rows:?}"))
+}
+
+/// 四桶 + total 一起取，便于逐条断言。
+fn buckets(row: &Value) -> (u64, u64, u64, u64, u64) {
+    (
+        row["input"].as_u64().unwrap(),
+        row["output"].as_u64().unwrap(),
+        row["cache_read"].as_u64().unwrap(),
+        row["cache_write"].as_u64().unwrap(),
+        row["total"].as_u64().unwrap(),
+    )
+}
+
+/// openai 非流式：`input = prompt_tokens - cached_tokens` 归一、`total` = 四桶之和；
+/// app 维度独立累加（两 app 各自翻倍 / 单次，互不串）；无凭证流量单列
+/// `app: null` 条目（ADR-L20）。
+#[tokio::test]
+async fn llm_usage_records_per_app_buckets() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![provider(
+        "openai-official",
+        Protocol::Openai,
+        &upstream,
+    )])
+    .await;
+    create_app(&gw, &json!({"id": "app-a", "key": "key-a"})).await;
+    create_app(&gw, &json!({"id": "app-b", "key": "key-b"})).await;
+
+    let body = json!({"model": "gpt-4o"});
+    let path = "/llm/openai/v1/chat/completions";
+    for _ in 0..2 {
+        let (status, _) = post_chat_with_key(&gw, path, &body, "key-a").await;
+        assert_eq!(status, 200);
+    }
+    let (status, _) = post_chat_with_key(&gw, path, &body, "key-b").await;
+    assert_eq!(status, 200);
+    let (status, _) = post_chat(&gw, path, &body).await;
+    assert_eq!(status, 200);
+
+    let rows = usage_view(&gw, "").await;
+    assert_eq!(rows.len(), 3, "应有 3 行：app-a / app-b / 无凭证");
+    // 无凭证条目：单列、app 为 null
+    let anon = usage_row(&rows, None);
+    assert_eq!(anon["date"], today());
+    assert_eq!(buckets(&anon), (6, 5, 4, 0, 15));
+    // app 维度互不串：a 两次累加，b 一次
+    assert_eq!(
+        buckets(&usage_row(&rows, Some("app-a"))),
+        (12, 10, 8, 0, 30)
+    );
+    assert_eq!(buckets(&usage_row(&rows, Some("app-b"))), (6, 5, 4, 0, 15));
+}
+
+/// anthropic 非流式：四个原生字段一一落到四个桶（ADR-L20 跨协议桶对齐）。
+#[tokio::test]
+async fn llm_usage_records_anthropic_cache_buckets() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![provider(
+        "anthropic-official",
+        Protocol::Anthropic,
+        &upstream,
+    )])
+    .await;
+
+    let (status, _) = post_chat(
+        &gw,
+        "/llm/anthropic/v1/messages",
+        &json!({"model": "claude-3-5-sonnet"}),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let rows = usage_view(&gw, "").await;
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert!(row["app"].is_null());
+    assert_eq!(row["date"], today());
+    // input 3 / output 7 / cache_read 2 / cache_write 1 = total 13
+    assert_eq!(buckets(row), (3, 7, 2, 1, 13));
+}
+
+/// 流式也记账：openai SSE 末块 usage 聚合（含 cached 归一）；anthropic SSE
+/// 取首个 input/cache 值 + 末个累计 output（`extract_usage` SSE 契约）。
+#[tokio::test]
+async fn llm_usage_records_from_streaming_final_chunk() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![
+        provider("openai-official", Protocol::Openai, &upstream),
+        provider("anthropic-official", Protocol::Anthropic, &upstream),
+    ])
+    .await;
+    // 同日两笔流量天然合并：用 app 凭证把两协议拆成两行
+    create_app(&gw, &json!({"id": "app-a", "key": "key-a"})).await;
+
+    let (status, _) = post_chat_with_key(
+        &gw,
+        "/llm/openai/v1/chat/completions",
+        &json!({"model": "gpt-4o", "stream": true}),
+        "key-a",
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, _) = post_chat(
+        &gw,
+        "/llm/anthropic/v1/messages",
+        &json!({"model": "claude-3-5-sonnet", "stream": true}),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let rows = usage_view(&gw, "").await;
+    assert_eq!(rows.len(), 2);
+    // openai SSE：prompt 10 - cached 4 = input 6
+    assert_eq!(buckets(&usage_row(&rows, Some("app-a"))), (6, 5, 4, 0, 15));
+    // anthropic SSE：message_start 的 input/cache + message_delta 的累计 output
+    assert_eq!(buckets(&usage_row(&rows, None)), (3, 7, 2, 1, 13));
+}
+
+/// `/__admin/llm/usage` 过滤：`app` / `date` / `from`-`to`（闭区间）AND 语义；
+/// 结果按 `(date, app)` 升序、无凭证条目同日最前；非法日期参数 → 400。
+#[tokio::test]
+async fn llm_usage_view_filters_by_app_date_range() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![provider(
+        "openai-official",
+        Protocol::Openai,
+        &upstream,
+    )])
+    .await;
+    create_app(&gw, &json!({"id": "app-a", "key": "key-a"})).await;
+    create_app(&gw, &json!({"id": "app-b", "key": "key-b"})).await;
+
+    let body = json!({"model": "gpt-4o"});
+    let path = "/llm/openai/v1/chat/completions";
+    let (status, _) = post_chat_with_key(&gw, path, &body, "key-a").await;
+    assert_eq!(status, 200);
+    let (status, _) = post_chat_with_key(&gw, path, &body, "key-b").await;
+    assert_eq!(status, 200);
+    let (status, _) = post_chat(&gw, path, &body).await;
+    assert_eq!(status, 200);
+
+    // app 过滤
+    let rows = usage_view(&gw, "?app=app-a").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["app"], json!("app-a"));
+
+    // date 过滤：今天全中、昨天空
+    assert_eq!(
+        usage_view(&gw, &format!("?date={}", today())).await.len(),
+        3
+    );
+    assert_eq!(
+        usage_view(&gw, &format!("?date={}", shift_days(-1)))
+            .await
+            .len(),
+        0
+    );
+
+    // 闭区间 from/to：昨天到明天全中、明天起空
+    assert_eq!(
+        usage_view(
+            &gw,
+            &format!("?from={}&to={}", shift_days(-1), shift_days(1))
+        )
+        .await
+        .len(),
+        3
+    );
+    assert_eq!(
+        usage_view(&gw, &format!("?from={}", shift_days(1)))
+            .await
+            .len(),
+        0
+    );
+
+    // 升序：无凭证条目（app = null）同日最前
+    let rows = usage_view(&gw, "").await;
+    assert!(rows[0]["app"].is_null());
+    assert_eq!(rows[1]["app"], json!("app-a"));
+    assert_eq!(rows[2]["app"], json!("app-b"));
+
+    // 非法日期 → 400（错误体带参数名与原值）
+    for bad in ["not-a-date", "26-11-06"] {
+        let resp = admin_get(&gw, &format!("/__admin/llm/usage?date={bad}")).await;
+        assert_eq!(resp.status(), 400, "date={bad} 应被拒绝");
+        let err = error_body(resp).await;
+        let msg = err["message"].as_str().unwrap();
+        assert!(msg.contains(&format!("date='{bad}'")), "消息: {msg}");
+    }
+    let resp = admin_get(&gw, "/__admin/llm/usage?from=2026-13-01").await;
+    assert_eq!(resp.status(), 400);
+}
+
+/// 账本写盘与重启加载（ADR-L20/L21）：flush 落 `usage.toml` 且 round-trip；
+/// 另一网关（新 state）从文件加载后历史可见，同日同 app 行接着累计。
+#[tokio::test]
+async fn llm_usage_ledger_flush_writes_and_reloads() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![provider(
+        "openai-official",
+        Protocol::Openai,
+        &upstream,
+    )])
+    .await;
+
+    let (status, _) = post_chat(
+        &gw,
+        "/llm/openai/v1/chat/completions",
+        &json!({"model": "gpt-4o"}),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // flush：dirty → 全量写盘（harness 直接调，测试里 usage_flush_secs = 0）
+    gw.state.llm_usage.flush_if_dirty(&gw.usage_path).unwrap();
+    assert!(gw.usage_path.exists(), "usage.toml 应被创建");
+
+    // 落盘行与查询快照一致（round-trip）。盘上无凭证条目写作 `app = ""`
+    // （无 app id 可落），经 set_all → snapshot 边界再转回 null，与端点形态对齐。
+    let rows = usage_view(&gw, "").await;
+    let entries = config::load_usage(&gw.usage_path).unwrap();
+    let reloaded = UsageLedger::new();
+    reloaded.set_all(entries);
+    assert_eq!(
+        serde_json::to_value(reloaded.snapshot(&UsageFilter::default())).unwrap(),
+        Value::Array(rows.clone())
+    );
+    let on_disk = std::fs::read_to_string(&gw.usage_path).unwrap();
+    assert!(
+        on_disk.contains("app = \"\""),
+        "盘上无凭证条目应为 app = \"\": {on_disk}"
+    );
+
+    // 「重启」：新网关加载同一份 usage.toml
+    let dir2 = tempfile::tempdir().unwrap();
+    let providers2 = dir2.path().join("providers.toml");
+    config::save_providers(
+        &providers2,
+        &[provider("openai-official", Protocol::Openai, &upstream)],
+    )
+    .unwrap();
+    let usage2 = dir2.path().join("usage.toml");
+    std::fs::copy(&gw.usage_path, &usage2).unwrap();
+    let state2 = AppState::new(llm_settings(
+        dir2.path().join("routes.toml"),
+        providers2.clone(),
+        dir2.path().join("apps.toml"),
+        usage2.clone(),
+    ))
+    .unwrap();
+    state2
+        .providers
+        .set_all(config::load_providers(&providers2).unwrap());
+    state2
+        .llm_usage
+        .set_all(config::load_usage(&usage2).unwrap());
+    let app2 = build_app(state2.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr2 = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app2).await;
+    });
+    let usage_url = format!("http://{addr2}/__admin/llm/usage");
+
+    // 历史可见：reload 后行与 flush 前一致（不新建条目）
+    let hist: Value = reqwest::Client::new()
+        .get(&usage_url)
+        .header("X-Admin-Key", ADMIN_KEY)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(hist["usage"].as_array().unwrap(), &rows);
+
+    // 新请求在已加载的历史上接着累计（同日同 app 行合并）
+    let resp = authed()
+        .post(format!("http://{addr2}/llm/openai/v1/chat/completions"))
+        .json(&json!({"model": "gpt-4o"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let after: Value = reqwest::Client::new()
+        .get(&usage_url)
+        .header("X-Admin-Key", ADMIN_KEY)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let after_rows = after["usage"].as_array().unwrap();
+    assert_eq!(after_rows.len(), 1);
+    assert_eq!(buckets(&after_rows[0]), (12, 10, 8, 0, 30));
+
+    // 累计后的账本再次 round-trip 落盘
+    state2.llm_usage.flush_if_dirty(&usage2).unwrap();
+    let reloaded = config::load_usage(&usage2).unwrap();
+    assert_eq!(reloaded.len(), 1);
+    let row = &reloaded[0];
+    assert_eq!(
+        (row.input, row.output, row.cache_read, row.total),
+        (12, 10, 8, 30)
+    );
+}
+
+/// flush 不是无脑周期写：干净账本（无流量 / 刚加载）既不创建文件也不改文件。
+#[tokio::test]
+async fn llm_usage_ledger_clean_no_op() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![provider(
+        "openai-official",
+        Protocol::Openai,
+        &upstream,
+    )])
+    .await;
+
+    // 无流量：不创建文件
+    assert!(!gw.usage_path.exists());
+    gw.state.llm_usage.flush_if_dirty(&gw.usage_path).unwrap();
+    assert!(!gw.usage_path.exists(), "干净账本不应创建 usage.toml");
+
+    // 有流量：flush 一次后 dirty 已清，再 flush 内容逐字节不变
+    let (status, _) = post_chat(
+        &gw,
+        "/llm/openai/v1/chat/completions",
+        &json!({"model": "gpt-4o"}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    gw.state.llm_usage.flush_if_dirty(&gw.usage_path).unwrap();
+    let first = std::fs::read_to_string(&gw.usage_path).unwrap();
+    gw.state.llm_usage.flush_if_dirty(&gw.usage_path).unwrap();
+    assert_eq!(std::fs::read_to_string(&gw.usage_path).unwrap(), first);
+}
+
+/// systemone 桩（ADR-L8/L20）：上游响应里明明有 usage，账本条目存在但四桶恒 0
+/// ——账本不因桩产生虚假用量，同时保留可审计的条目。
+#[tokio::test]
+async fn llm_usage_records_systemone_zero_buckets() {
+    let upstream = spawn_mock_llm().await;
+    let gw = spawn_llm_gateway(vec![provider(
+        "systemone-a",
+        Protocol::Systemone,
+        &upstream,
+    )])
+    .await;
+
+    let (status, v) = post_chat(
+        &gw,
+        "/llm/systemone/v1/chat/completions",
+        &json!({"model": "gpt-4o"}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    // 上游确实回了 usage（桩对账本「视而不见」的前提）
+    assert_eq!(v["usage"]["total_tokens"], 15);
+
+    let rows = usage_view(&gw, "").await;
+    assert_eq!(rows.len(), 1, "条目存在但桶为 0");
+    assert!(rows[0]["app"].is_null());
+    assert_eq!(buckets(&rows[0]), (0, 0, 0, 0, 0));
 }
 
 // ---------------------------------------------------------------- examples

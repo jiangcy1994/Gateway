@@ -89,6 +89,9 @@ pub enum ApiError {
     #[error("failed to fetch access token: {0}")]
     TokenFetchFailed(String),
 
+    #[error("invalid usage query: {0}")]
+    InvalidUsageQuery(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -127,6 +130,7 @@ impl ApiError {
             | ApiError::DuplicateBotAppId(_) => StatusCode::BAD_REQUEST,
             ApiError::BotDisabled(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::TokenFetchFailed(_) => StatusCode::BAD_GATEWAY,
+            ApiError::InvalidUsageQuery(_) => StatusCode::BAD_REQUEST,
         }
     }
 }
