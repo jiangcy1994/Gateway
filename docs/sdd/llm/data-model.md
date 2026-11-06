@@ -47,6 +47,7 @@ enum Protocol { Openai, Anthropic, Systemone }
 | `tpm_limit` | `Option<u64>` | 同上 |
 | `models` | `Vec<Model>` | 默认空表；**空表 = 协议级兜底**：参与任意 model 请求的选择、不改写 `model` 字段，effective priority = `i32::MIN`（ADR-L14） |
 | `timeout_secs` | `Option<u64>` | `Some(n)` 时 `n > 0`；缺省 = 回落 `GATEWAY_DEFAULT_TIMEOUT`（ADR-L17） |
+| `proxy_url` | `Option<String>` | 缺省 = 共享直连 client（`state.client`）；给值时 scheme ∈ {http,https}、host 非空且可被 `reqwest::Proxy::all` 解析（ADR-L19） |
 | `enabled` | `bool` | 默认 `true`；`false` 时**该供应商**被选择排除（协议池全禁 → 503） |
 
 ### 不变式
@@ -63,6 +64,7 @@ enum Protocol { Openai, Anthropic, Systemone }
 | P8 | `Model.upstream` 为 `Some` 时非空 | `Provider::validate` |
 | P9 | 空模型表 = 协议级兜底（effective priority = `i32::MIN`，不改写 body）；模型表与限额正交——限额仍按供应商记一份（P5 不因模型表改变） | 结构本身 + balancer 的分层规则 |
 | P10 | `timeout_secs` 为 `Some(n)` 时 `n > 0` | `Provider::validate` |
+| P14 | `proxy_url` 为 `Some(u)` 时：scheme ∈ {http, https}、host 非空，且 `u` 可被 `reqwest::Proxy::all(u)` 解析；socks5 等本构建未启用 `socks` feature 的形态判非法 | `Provider::validate`（配置时 400，而非请求时 500） |
 
 ## 核心值对象：`App`（app.rs）
 
@@ -100,6 +102,14 @@ ProviderTable { providers: Arc<RwLock<Vec<Provider>>> }
 ```
 
 线性表（与 `RouteTable` 同构）。`list_enabled_by_protocol(protocol)` 仍是无 model 请求的入口；带 model 的请求走 `pool_for(protocol, model)`（见 `interfaces.md`）。
+
+### `ClientCache`（client.rs，ADR-L19）
+
+```rust
+ClientCache { clients: Arc<RwLock<HashMap<String, reqwest::Client>>> }
+```
+
+按 `proxy_url` 复用 reqwest client（每个代理 url 一个自带连接池的 client）；`None` 永远映射到 `AppState.client`（共享直连 client），不进缓存表。缓存只增不删；代理 url 变更后旧 client 自然淘汰。
 
 ### `AppTable`（app.rs）
 
@@ -161,6 +171,8 @@ base_url = "https://api.shared-vendor.example"
 api_key = "sk-..."
 rpm_limit = 500
 tpm_limit = 150000
+timeout_secs = 30
+proxy_url = "http://127.0.0.1:7890"   # 缺省 = 直连（共享 client，ADR-L19）
 enabled = true
 
   [[providers.models]]
@@ -209,6 +221,7 @@ apps.toml ──load_apps──→ Vec<App> ──set_all──→ AppTable
                                   │              └──── save_apps（原子写回）──┘
                                   │
 请求 body（≤16MiB）→ 取 model → app 组合校验 → balancer → 改写 model → 上游
+Provider.proxy_url ──ClientCache.get──→ forward（选 client：None = 共享直连，Some = 按代理复用）
 选择/派遣 ──同一临界区──→ QuotaTracker.requests（RPM 计数）
 响应流 tap ──TailBuffer→ extract_tokens ──→ QuotaTracker.tokens（TPM 记账）
 QuotaTracker / RouteStats ──快照──→ /__admin/llm/quota · /__admin/llm/metrics

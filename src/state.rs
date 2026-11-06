@@ -5,6 +5,7 @@ use crate::config::{self, Settings};
 use crate::error::ApiError;
 use crate::health::HealthState;
 use crate::llm::app::AppTable;
+use crate::llm::client::ClientCache;
 use crate::llm::provider::ProviderTable;
 use crate::llm::quota::QuotaTracker;
 use crate::metrics::RouteStats;
@@ -29,6 +30,8 @@ pub struct AppState {
     pub bots: BotTable,
     pub bot_tokens: TokenStore,
     pub bot_ws: WsTable,
+    /// 按 `proxy_url` 复用的代理 client（ADR-L19）；`None` 的供应商用 `client`。
+    pub llm_clients: ClientCache,
     pub(crate) stats: Arc<RwLock<HashMap<String, Arc<RouteStats>>>>,
     pub(crate) health: Arc<RwLock<HashMap<String, HealthState>>>,
     pub(crate) llm_stats: Arc<RwLock<HashMap<String, Arc<RouteStats>>>>,
@@ -50,6 +53,7 @@ impl AppState {
             bots: BotTable::default(),
             bot_tokens: TokenStore::new(),
             bot_ws: WsTable::new(),
+            llm_clients: ClientCache::new(),
             stats: Arc::new(RwLock::new(HashMap::new())),
             health: Arc::new(RwLock::new(HashMap::new())),
             llm_stats: Arc::new(RwLock::new(HashMap::new())),

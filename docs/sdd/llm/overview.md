@@ -30,7 +30,8 @@ top-gateway:8000
             → 读 body 取 model → app 组合校验
             → 候选池 = 协议匹配 && (模型表为空 || 声明了该 model)，按优先级分层选供应商
             → 选中条目的 upstream 名与请求 model 不同则改写 body 的 model 字段
-            → 注入供应商凭证、按供应商 timeout（缺省=全局）转发
+            → 注入供应商凭证、按供应商选 client（proxy_url 缺省=共享直连，ADR-L19）、
+              按供应商 timeout（缺省=全局）转发
 ```
 
 两种入站形态并存（ADR-L12）：**SDK 直接指 `/llm/v1` 最省事**（OpenAI 与 Anthropic 的 SDK 都把 base_url 拼成 `{base}/v1/{端点}`）；需要无歧义或有歧义端点（`models`、`files` 两协议都有）时用**显式协议段** `/llm/{protocol}/...`。
@@ -46,6 +47,7 @@ top-gateway:8000
 - **应用组合**（ADR-L15）：入站 `Authorization: Bearer <k>` 或 `x-api-key: <k>` 即应用凭证（客户端把 app key 填在 SDK 原本填供应商 key 的位置）。无凭证 → 默认策略 = 全部已映射模型（继续放行）；凭证命中 app 且其 `models` 非空时，请求 model 不在组合内 → `403`；凭证未命中任何 app → `401`；命中的 app 被禁用 → `403`。
 - 配额全部耗尽 → `429`；该协议一个供应商都没配 → `503`；请求带模型时：无任何供应商声明该模型 → `404`，模型有声明但池空（全禁 / 协议不匹配）→ `503`；未知协议段 → `404`；v1 推断失败（两协议共用的端点 / 未知端点 / v1 后无端点）→ `404` 并提示改用显式协议段。
 - **按供应商超时**（ADR-L17）：provider 可设 `timeout_secs`（缺省回落 `GATEWAY_DEFAULT_TIMEOUT`）。
+- **按供应商 HTTP 代理**（ADR-L19）：provider 可设 `proxy_url`（缺省 = 共享直连 client，与全局行为一致）。配了代理的供应商经**按代理 url 复用的 reqwest client**（自带连接池）转发；HTTP 与 HTTPS 代理均支持（HTTPS 目标走 CONNECT 隧道），socks5 不支持并由 `validate` 拒绝。代理不可达与上游不可达同处理（502）。
 - 供应商 CRUD 管理 API（`/__admin/llm/providers*`，与路由 CRUD 同构、合并式更新）+ 应用 CRUD（`/__admin/llm/apps*`，同构）+ 配额查看（`/__admin/llm/quota`）+ 指标（`/__admin/llm/metrics`，复用 `RouteStats`）。
 - 供应商配置原子持久化到 `GATEWAY_PROVIDERS_FILE`（默认 `providers.toml`）、应用到 `GATEWAY_APPS_FILE`（默认 `apps.toml`），重启不丢失。
 - 供应商凭证按协议注入（OpenAI/SystemOne → `Authorization: Bearer`；Anthropic → `x-api-key` + 缺省 `anthropic-version`）。
@@ -60,6 +62,7 @@ top-gateway:8000
 - 不做排队 / 退避管控：全满即 429，何时重试由客户端决定。
 - 不做跨厂商模型名翻译：`model` 改写只在**同一供应商内部**（网关名 → 该供应商的上游名）；OpenAI 格式的请求仍只打 openai 协议池（ADR-L2 不变）。
 - 不做组合校验的旁路补救：无 `model` 字段 / 非 JSON / 超出缓冲上限的请求**无法校验组合**，按协议级路由放行（风险 R11 记录此盲区）。
+- **不支持 socks5 代理**：reqwest 的 `socks` feature 未启用，`proxy_url` 只接受 `http://` / `https://`（风险 R14）。HTTP/HTTPS 代理已覆盖主流本地代理形态。
 
 ## 用户与典型用法
 

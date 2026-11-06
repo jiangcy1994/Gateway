@@ -136,6 +136,8 @@ api_key = "sk-..."
 rpm_limit = 60                   # 每分钟请求数限额，缺省 = 不限
 tpm_limit = 100000               # 每分钟 token 数限额，缺省 = 不限
 timeout_secs = 30                # 该供应商的上游超时，缺省 = GATEWAY_DEFAULT_TIMEOUT_SECS
+# proxy_url = "http://127.0.0.1:7890"  # 该供应商的 HTTP 代理，缺省 = 直连；
+                                       # http/https 均可，socks5 不支持
 enabled = true
 
   [[providers.models]]           # 模型映射表，缺省 = 空表（协议级兜底，见下）
@@ -152,14 +154,21 @@ enabled = true
 为 `i32::MIN`——只要有一个供应商显式声明了该模型，兜底就永远排在最后。这让
 不带模型表的旧部署继续工作，也给了渐进迁移路径。
 
+**按供应商代理**：`proxy_url` 让某一家供应商独自走 HTTP 代理（典型场景：部署
+环境里只有个别上游需要经 `127.0.0.1:7890` 这类本地代理才可达）。代理只影响
+配它的那一家，其余供应商照常共享直连 client；代理本身不可达时按上游不可达
+处理（`502`，消息带供应商 id）。scheme 限 `http`/`https`——`socks5://` 在
+配置校验阶段即被拒绝（`400`）。
+
 **应用组合**（`apps.toml`）：入站凭证即应用身份——客户端把网关签发的 key 填在
 SDK 原本填供应商 key 的位置（`Authorization: Bearer <key>` 或 `x-api-key`），
 网关据此识别来源 app 并限制其可用模型集合；同时客户端凭证一律被替换成选中
 供应商的凭证。
 
-> 完整示例配置（按真实拓扑示范模型映射、分层兜底、按供应商超时与应用组合）
-> 见 [examples/](examples/)——示例文件由 `llm_example_configs_parse_and_validate`
-> 钉住解析与 `validate`，不会随代码演进腐坏。
+> 完整示例配置（按真实拓扑示范模型映射、分层兜底、按供应商超时、按供应商代理
+> 与应用组合）见 [examples/](examples/)——示例文件由
+> `llm_example_configs_parse_and_validate` 钉住解析与 `validate`，不会随代码
+> 演进腐坏。
 
 ```toml
 [[apps]]
@@ -183,7 +192,7 @@ LLM 管理端点（同样需要 `X-Admin-Key`）：
 |---|---|---|
 | GET | `/__admin/llm/providers` | 列出全部供应商 |
 | POST | `/__admin/llm/providers` | 新增供应商；`id` 省略时生成 UUID |
-| GET/PUT/DELETE | `/__admin/llm/providers/{id}` | 查看 / 合并式更新 / 删除（PUT 显式 `null` = 设为不限） |
+| GET/PUT/DELETE | `/__admin/llm/providers/{id}` | 查看 / 合并式更新 / 删除（PUT 显式 `null` = 设为不限 / 清除代理覆盖） |
 | GET | `/__admin/llm/apps` | 列出全部应用（含 key） |
 | POST | `/__admin/llm/apps` | 新增应用；`id`/`key` 省略时生成 |
 | GET/PUT/DELETE | `/__admin/llm/apps/{id}` | 查看 / 合并式更新 / 删除 |

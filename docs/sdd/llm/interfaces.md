@@ -37,17 +37,18 @@ systemone 不参与推断（只能经显式协议段 `/llm/systemone/...` 访问
 
 ### `Provider`（结构体）
 
-字段与不变式见 `data-model.md`（P1–P10）。实现 `Serialize/Deserialize`（TOML 与 JSON 共用同一结构）。`protocols` 字段反序列化同时接受列表与**旧形态单值**（`#[serde(alias = "protocol")]`，见 ADR-L13）；序列化只产出列表形态。`models` / `timeout_secs` 均可缺省（`#[serde(default)]` / `Option`）——**不带模型表的旧 providers.toml 与旧测试继续通过**（兜底语义，ADR-L14）。
+字段与不变式见 `data-model.md`（P1–P10）。实现 `Serialize/Deserialize`（TOML 与 JSON 共用同一结构）。`protocols` 字段反序列化同时接受列表与**旧形态单值**（`#[serde(alias = "protocol")]`，见 ADR-L13）；序列化只产出列表形态。`models` / `timeout_secs` / `proxy_url` 均可缺省（`#[serde(default)]` / `Option`）——**不带模型表的旧 providers.toml 与旧测试继续通过**（兜底语义，ADR-L14）。
 
 ### `Provider::validate(&self) -> Result<(), String>`
 
 - 前置：字段已填充。
 - 后置：全部规则通过返回 `Ok(())`；任一失败 `Err(原因)`（管理 API 映射 400）。
-- 规则（顺序即错误优先级）：`id` 非空 → `protocols` 非空 → `protocols` 无重复 → `base_url` scheme ∈ {http,https} → `base_url` host 非空 → `api_key` 非空 → `rpm_limit`/`tpm_limit` 为 `Some` 时 `> 0` → `timeout_secs` 为 `Some` 时 `> 0` → `models` 每项 `name` 非空 → `models` 内 `name` 无重复 → `models` 每项 `upstream` 为 `Some` 时非空。
+- 规则（顺序即错误优先级）：`id` 非空 → `protocols` 非空 → `protocols` 无重复 → `base_url` scheme ∈ {http,https} → `base_url` host 非空 → `api_key` 非空 → `rpm_limit`/`tpm_limit` 为 `Some` 时 `> 0` → `timeout_secs` 为 `Some` 时 `> 0` → `proxy_url` 为 `Some` 时 scheme ∈ {http,https}、host 非空且可被 `reqwest::Proxy::all` 解析（P14，ADR-L19） → `models` 每项 `name` 非空 → `models` 内 `name` 无重复 → `models` 每项 `upstream` 为 `Some` 时非空。
+- `proxy_url` 校验**不只做字符串检查**：同时尝试构造 `reqwest::Proxy::all(url)`，把 reqwest 能感知而字符串校验漏过的非法形态（如 userinfo 里带非法字符）拦在配置时（400），而不是请求时（500）。
 
 ### `Provider::apply_patch(&self, patch: ProviderPatch) -> Provider`
 
-- 后置：`Some` 字段覆盖，`None` 保留；**`id` 永远来自 `self`**；不校验（调用方 `replace` 前调 `validate`）。`models` 为 `Option<Vec<Model>>`：缺省 / 显式 `null` = 保留原表；给列表 = 整体替换；给空列表 `[]` = 清空模型表（回到兜底）。
+- 后置：`Some` 字段覆盖，`None` 保留；**`id` 永远来自 `self`**；不校验（调用方 `replace` 前调 `validate`）。`models` 为 `Option<Vec<Model>>`：缺省 / 显式 `null` = 保留原表；给列表 = 整体替换；给空列表 `[]` = 清空模型表（回到兜底）。`proxy_url` 为 `Option<Option<String>>`：缺省 = 保留原值；显式 `null` = 清除（回到共享直连 client）；字符串 = 设新代理。
 
 ### `ProviderTable::{set_all, list, get, add, replace, remove, list_enabled_by_protocol, pool_for, declares_model}`
 
@@ -166,6 +167,22 @@ Selection { provider: Provider, upstream_model: Option<String> }
 
 ---
 
+## client.rs（新增，ADR-L19）
+
+### `ClientCache`（结构体）
+
+按 `proxy_url` 复用 reqwest client（每个代理 url 一个自带连接池的 client），`None` 永远映射到 `AppState::client`（共享直连 client）。
+
+| 方法 | 签名 | 后置 / 错误 |
+|---|---|---|
+| `new` | `() -> Self` | 空缓存 |
+| `get` | `(&self, proxy_url: Option<&str>, direct: &reqwest::Client) -> Result<reqwest::Client, ApiError>` | `None` → 克隆共享直连 client；`Some(url)` → 命中缓存返回克隆，未命中构建 `Client::builder().proxy(Proxy::all(url))` 并写入缓存后返回克隆；构建失败 → `Err(Internal(...))`（→ **500**，防御性兜底——`validate` 已把绝大数非法 url 拦在配置时） |
+
+- 并发：`RwLock<HashMap<String, reqwest::Client>>`，读路径（命中）只取读锁；「查不到再取写锁 or_insert」与 `AppState::stats_for` 同构。锁中毒 panic（与 `RouteTable` 同策略）。
+- 缓存只增不删：供应商改/删代理 url 后旧 client 自然淘汰（无 leases 时由 reqwest 连接池回收），不做显式失效——代理 url 变更是低频管理操作。
+
+---
+
 ## forward.rs
 
 ### `forward(State<AppState>, Method, OriginalUri, HeaderMap, Request) -> Response`
@@ -189,10 +206,11 @@ Selection { provider: Provider, upstream_model: Option<String> }
      - `openai` / `systemone`：`Authorization: Bearer <api_key>`
      - `anthropic`：`x-api-key: <api_key>`；`anthropic-version` **不存在时**补 `2023-06-01`（客户端已传则保留原值）
   10. 附 `x-forwarded-host` / `x-forwarded-path`（同 proxy 行为）。
-  11. 超时 = `provider.timeout_secs.unwrap_or(settings.default_timeout_secs)`（ADR-L17）包裹 `send()`：传输错误 → `502`（消息含 provider id）；超时 → `504`；均 `record_error()`。
-  12. 响应头：剥 hop-by-hop + `content-length`；**注入 `x-llm-provider: <provider id>`**。
-  13. body：`Body::from_stream(usage tap)`——每块向客户端转发的同时复制进 `TailBuffer`；流正常结束 / 上游流出错 / **消费者断开** 三种情形都触发一次 `extract_tokens → record_tokens`（互斥，只记一次）。**请求 body 不流式（已缓冲），响应 body 仍流式**。
-  14. 上游 5xx：状态与 body 原样透传，同时计一次错误；4xx 原样透传不计错误。
+  11. **选择 HTTP client**（ADR-L19）：`provider.proxy_url` 为 `None` → 用共享直连 client（`state.client`）；`Some(url)` → 向 `state.llm_clients` 按 url 取（缺则构建 `reqwest::Client::builder().proxy(Proxy::all(url))` 并缓存）**直连/代理 client 均复用连接池**。构建失败 → `500`（`ApiError::Internal`；`validate` 已拦过绝大多数非法 url，此处是防御性兜底）。
+  12. 超时 = `provider.timeout_secs.unwrap_or(settings.default_timeout_secs)`（ADR-L17）包裹 `send()`：传输错误 → `502`（消息含 provider id）；超时 → `504`；均 `record_error()`。**超时包裹与 client 选择无关**——换 client 不改变超时语义。
+  13. 响应头：剥 hop-by-hop + `content-length`；**注入 `x-llm-provider: <provider id>`**。
+  14. body：`Body::from_stream(usage tap)`——每块向客户端转发的同时复制进 `TailBuffer`；流正常结束 / 上游流出错 / **消费者断开** 三种情形都触发一次 `extract_tokens → record_tokens`（互斥，只记一次）。**请求 body 不流式（已缓冲），响应 body 仍流式**。
+  15. 上游 5xx：状态与 body 原样透传，同时计一次错误；4xx 原样透传不计错误。
 - 错误体：全部使用 `proxy::error_response` 的 house 格式。
 - 常量：`pub const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;`
 
@@ -218,8 +236,9 @@ Selection { provider: Provider, upstream_model: Option<String> }
 | DELETE | `/__admin/llm/apps/{id}` | `200 {"deleted":<id>}` | 404、401 |
 
 - 所有供应商变更端点成功后先 `state.persist_providers()`，应用变更端点先 `state.persist_apps()`，再返回；持久化失败 → 500。
-- `ProviderInput`（POST body）：`id`/`name` Option（id 省略生成），`protocols` 必填（接受单值或列表，见 ADR-L13），`base_url`/`api_key` 必填，`rpm_limit`/`tpm_limit`/`timeout_secs` Option，`models` Option（省略 = 空表）、`enabled` Option。
-- `ProviderPatch`（PUT body）：全 Option，与 `RoutePatch` 同构的合并语义。**`rpm_limit` / `tpm_limit` 为 `Option<Option<u64>>`**：字段缺省 = 保留原值；显式 `null` = 设为不限；数字 = 设新限额。`protocols` 为 `Option<Vec<Protocol>>`：缺省或显式 `null` = 保留原值；给列表（或单值）= 整体替换。`models` 为 `Option<Vec<Model>>`：缺省 / 显式 `null` = 保留原表；给列表 = 整体替换（`[]` = 清空，回到兜底）。`timeout_secs` 为 `Option<Option<u64>>`：缺省 = 保留；显式 `null` = 回落全局默认；数字 = 设新值。
+- GET（列表与单项）返回的供应商 JSON **总是带 `proxy_url` 键**：未配置时为 `null`（与 `rpm_limit`/`tpm_limit`/`timeout_secs` 同构）——对 0.2.2 之前的消费者是纯新增键，不影响既有解析。
+- `ProviderInput`（POST body）：`id`/`name` Option（id 省略生成），`protocols` 必填（接受单值或列表，见 ADR-L13），`base_url`/`api_key` 必填，`rpm_limit`/`tpm_limit`/`timeout_secs`/`proxy_url` Option，`models` Option（省略 = 空表）、`enabled` Option。
+- `ProviderPatch`（PUT body）：全 Option，与 `RoutePatch` 同构的合并语义。**`rpm_limit` / `tpm_limit` 为 `Option<Option<u64>>`**：字段缺省 = 保留原值；显式 `null` = 设为不限；数字 = 设新限额。`protocols` 为 `Option<Vec<Protocol>>`：缺省或显式 `null` = 保留原值；给列表（或单值）= 整体替换。`models` 为 `Option<Vec<Model>>`：缺省 / 显式 `null` = 保留原表；给列表 = 整体替换（`[]` = 清空，回到兜底）。`timeout_secs` 为 `Option<Option<u64>>`：缺省 = 保留；显式 `null` = 回落全局默认；数字 = 设新值。`proxy_url` 为 `Option<Option<String>>`：缺省 = 保留原值；显式 `null` = 清除代理（回到共享直连 client）；字符串 = 设新代理（同样要过 `validate` 的 P14 校验）。
 - `AppInput`（POST body）：`id`/`name` Option，`key` Option（省略生成），`models` Option（省略 = 不限制），`enabled` Option；无必填字段（全缺省成一个启用、不限模型的 app，id/key 自动生成）。**省略（`None`/缺字段）= 自动生成；显式空串或纯空白 = 非法，`validate` 判 400**（`InvalidApp` 由此可达，与 `Provider` 的「空 id → 400」一致）。
 - `AppPatch`（PUT body）：全 Option 合并语义；`models` 为 `Option<Vec<String>>`（缺省 / `null` = 保留；列表 = 替换；`[]` = 改为不限制）。
 
@@ -238,6 +257,7 @@ Selection { provider: Provider, upstream_model: Option<String> }
 
 - 后置：文件不存在 → `Ok(vec![])` 并告警（非致命，与 `load_routes` 同策略）；解析失败 → `ConfigLoad`（500）。
 - 重复 id 只告警、全部保留。
+- **加载不跑 `Provider::validate`**（与 `load_routes` 同构）：手工编辑写入的非法值（如 socks5 的 `proxy_url`、base_url 空串）能加载、启动不失败，只在请求时暴露——`validate` 的 400 闸门只覆盖管理 API 路径（风险 R13/R14）。
 
 ### `save_providers(path: &Path, providers: &[Provider]) -> Result<(), ApiError>`
 
@@ -276,6 +296,7 @@ Selection { provider: Provider, upstream_model: Option<String> }
 | `DuplicateAppId(id)` / `DuplicateAppKey(key)` | 400 | POST/PUT app 冲突（key 只回显 id 或脱敏形态，不回显完整 key） |
 | `AppNotFound(id)` | 404 | GET/PUT/DELETE 未知 app id |
 | `RequestBodyTooLarge` | 413 | 请求 body 超过 `MAX_REQUEST_BODY`（16 MiB） |
+| `Internal(msg)` | 500 | 运行时构建代理 client 失败（ADR-L19；`validate` 已拦绝大多数非法 `proxy_url`，此为防御性兜底） |
 
 `QuotaExhausted` 的消息从「protocol 名」改为「携带 model 信息的可读串」（有 model 时含 model 名）；无 model 时保持原语义（协议名）。错误体格式不变（house 格式）。
 

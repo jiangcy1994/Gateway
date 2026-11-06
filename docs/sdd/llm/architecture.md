@@ -8,12 +8,13 @@ LLM 子网关是 top-gateway 内嵌模块，代码在 `src/llm/`，与既有模�
 
 | 模块 | 职责 | 依赖 |
 |---|---|---|
-| `llm/provider.rs` | `Protocol` 枚举、`infer_protocol`（v1 端点闭表推断）、`Model` 值对象、`Provider` 值对象（`protocols` 多协议、`models` 模型表、`timeout_secs`）、`ProviderPatch`、`ProviderTable`（与 `router.rs` 的 `RouteTable` 同构） | `error.rs` |
+| `llm/provider.rs` | `Protocol` 枚举、`infer_protocol`（v1 端点闭表推断）、`Model` 值对象、`Provider` 值对象（`protocols` 多协议、`models` 模型表、`timeout_secs`、`proxy_url`）、`ProviderPatch`、`ProviderTable`（与 `router.rs` 的 `RouteTable` 同构） | `error.rs`、`reqwest`（`proxy_url` 配置时解析校验） |
 | `llm/app.rs` | `App` 值对象（应用凭证 → 模型组合）、`AppInput`/`AppPatch`、`AppTable`（与 `ProviderTable` 同构）；key 比较用常量时间 | `error.rs`（`constant_time_eq` 复用自 `admin.rs`） |
 | `llm/quota.rs` | `QuotaTracker`：供应商级 60s 滚动窗口的 RPM/TPM 计数与剩余量 | 无（纯内存 + `Mutex`） |
 | `llm/balancer.rs` | `select_and_record`：按协议 + 模型过滤候选 → **优先级分层** → 层内加权随机 → **同临界区记 RPM**，返回 `Selection { provider, upstream_model }` | `provider.rs`、`quota.rs`、`state.rs` |
 | `llm/usage.rs` | `TailBuffer`（尾部缓冲）+ `extract_tokens`：从响应尾包按协议提取 token 数 | `provider.rs`（`Protocol`） |
-| `llm/forward.rs` | `/llm/*` 转发处理器：解析两种入站形态、app 解析、请求 body 缓冲与 `model` 提取 / 改写、按供应商超时、鉴权头注入、流式转发、usage 记账 tap | 以上全部 + `proxy.rs` 的 `error_response` |
+| `llm/client.rs`（新增，ADR-L19） | `ClientCache`：按 `proxy_url` 复用自带连接池的 reqwest client（每个代理 url 一个）；`None` 永远映射到共享直连 client | `error.rs`（构建失败 → `Internal`） |
+| `llm/forward.rs` | `/llm/*` 转发处理器：解析两种入站形态、app 解析、请求 body 缓冲与 `model` 提取 / 改写、按供应商选 client（直连 / 代理）、按供应商超时、鉴权头注入、流式转发、usage 记账 tap | 以上全部 + `proxy.rs` 的 `error_response` |
 | `llm/admin.rs` | `/__admin/llm/*` 端点（供应商 CRUD / 应用 CRUD / 配额 / 指标），复用 `require_admin` | `provider.rs`、`app.rs`、`state.rs`、`metrics.rs` |
 
 ## 请求流程
@@ -60,8 +61,17 @@ forward handler（llm/forward.rs）
  9. 请求头：剥 hop-by-hop / content-length / host / authorization / x-api-key；
       按协议注入供应商凭证（openai|systemone → Bearer；anthropic → x-api-key，
       anthropic-version 缺省补 "2023-06-01"，客户端已传则保留）
-10. timeout 包裹 send()：时长 = provider.timeout_secs，缺省回落
-      settings.default_timeout_secs（ADR-L17）；传输错误 → 502；超时 → 504（均 record_error）
+10. 选 HTTP client（ADR-L19）：proxy_url 为 None → 共享直连 client（state.client）；
+      Some(url) → 向 state.llm_clients 取（缺则构建并缓存）每个代理 url 一个
+      自带连接池的 client；构建失败 → 500（防御性，validate 已拦过绝大多数非法 url）
+11. timeout 包裹 send()：时长 = provider.timeout_secs，缺省回落
+      settings.default_timeout_secs（ADR-L17）；传输错误 → 502；超时 → 504（均 record_error）。
+      超时语义与 client 选择无关：直连 / 代理都吃同一包裹逻辑
+12. 响应头：剥 hop-by-hop / content-length；附 x-llm-provider: <id>
+13. 响应 body：Body::from_stream(usage tap)
+      └─ tap 每块复制进 TailBuffer（保留最后 64KiB），
+         流结束 / 出错 / 消费者断开时 extract_tokens → quota.record_tokens
+14. 上游 5xx → record_error 后原样透传
 11. 响应头：剥 hop-by-hop / content-length；附 x-llm-provider: <id>
 12. 响应 body：Body::from_stream(usage tap)
       └─ tap 每块复制进 TailBuffer（保留最后 64KiB），

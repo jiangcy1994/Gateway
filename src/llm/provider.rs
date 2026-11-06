@@ -141,6 +141,11 @@ pub struct Provider {
     /// `GATEWAY_DEFAULT_TIMEOUT`（ADR-L17）。
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// 转发到该供应商时走的 HTTP 代理；`None` = 共享直连 client（`state.client`）。
+    /// 给值时须 scheme http/https、host 非空且可被 `reqwest::Proxy::all` 解析
+    /// （ADR-L19；socks5 不支持——reqwest 的 `socks` feature 未启用）。
+    #[serde(default)]
+    pub proxy_url: Option<String>,
     /// `false` 时该供应商被选择排除（协议池全禁 → 503）。
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -267,12 +272,15 @@ pub struct ProviderInput {
     #[serde(default)]
     pub timeout_secs: Option<u64>,
     #[serde(default)]
+    pub proxy_url: Option<String>,
+    #[serde(default)]
     pub enabled: Option<bool>,
 }
 
 /// PUT body：全 Option 合并语义。`rpm_limit`/`tpm_limit`/`timeout_secs` 为
 /// `Option<Option<u64>>`——字段缺省 = 保留原值；显式 `null` = 设为不限/全局默认；
-/// 数字 = 设新值。
+/// 数字 = 设新值。`proxy_url` 为 `Option<Option<String>>`——缺省 = 保留原值；
+/// 显式 `null` = 清除代理（回到共享直连 client，ADR-L19）；字符串 = 设新代理。
 #[derive(Debug, Default, Deserialize)]
 pub struct ProviderPatch {
     #[serde(default)]
@@ -297,6 +305,10 @@ pub struct ProviderPatch {
     pub models: Option<Vec<Model>>,
     #[serde(default, deserialize_with = "deserialize_some")]
     pub timeout_secs: Option<Option<u64>>,
+    /// 缺省 = 保留原值；显式 `null` = 清除代理（回到共享直连 client）；
+    /// 字符串 = 设新代理（同样要过 `validate`）。
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub proxy_url: Option<Option<String>>,
     #[serde(default)]
     pub enabled: Option<bool>,
 }
@@ -355,6 +367,27 @@ impl Provider {
                 return Err("timeout_secs must be greater than 0".into());
             }
         }
+        if let Some(proxy_url) = &self.proxy_url {
+            let mut scheme_host = proxy_url.split("://");
+            let scheme = scheme_host.next().unwrap_or_default().to_ascii_lowercase();
+            if !matches!(scheme.as_str(), "http" | "https") {
+                return Err(format!(
+                    "proxy_url {proxy_url} must use http or https (socks5 is not supported)"
+                ));
+            }
+            let rest = scheme_host.next().unwrap_or_default();
+            let host = rest.split(['/', '?']).next().unwrap_or_default();
+            if host.trim().is_empty() {
+                return Err(format!("proxy_url {proxy_url} must have a host"));
+            }
+            // reqwest 能感知而字符串校验漏过的非法形态（如 userinfo 里的非法字符）
+            // 也拦在配置时（400），而不是请求时（500）。
+            if let Err(err) = reqwest::Proxy::all(proxy_url) {
+                return Err(format!(
+                    "proxy_url {proxy_url} is not a valid proxy url: {err}"
+                ));
+            }
+        }
         let mut known = Vec::new();
         for model in &self.models {
             if model.name.trim().is_empty() {
@@ -392,6 +425,7 @@ impl Provider {
             tpm_limit: patch.tpm_limit.unwrap_or(self.tpm_limit),
             models: patch.models.unwrap_or_else(|| self.models.clone()),
             timeout_secs: patch.timeout_secs.unwrap_or(self.timeout_secs),
+            proxy_url: patch.proxy_url.unwrap_or(self.proxy_url.clone()),
             enabled: patch.enabled.unwrap_or(self.enabled),
         }
     }
@@ -413,6 +447,7 @@ impl From<ProviderInput> for Provider {
             tpm_limit: input.tpm_limit,
             models: input.models,
             timeout_secs: input.timeout_secs,
+            proxy_url: input.proxy_url,
             enabled: input.enabled.unwrap_or(true),
         }
     }
