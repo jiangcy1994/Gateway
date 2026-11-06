@@ -84,6 +84,13 @@
 | `llm_file_level_proxy_url_routes_request_through_proxy` | ADR-L19 + `config.rs` 加载后置 | 文件态端到端：往 providers.toml 直接写 `proxy_url` → 启动加载后请求**实际走该代理**（代理端读到 absolute-form URI），钉住「磁盘配置 → 启动加载 → 转发」整条链路，而非只有管理 API 一条配置路径 |
 | `llm_hand_edited_invalid_proxy_loads_but_fails_at_request_time` | `config.rs` 加载后置（加载路径不跑 `validate`）+ 风险 R13/R14 | 手工写的 socks5 `proxy_url` 能加载、启动不失败（`load_providers` 不断言代理合法），首个请求以 502「provider ... unreachable」暴露——400 闸门只在管理 API 路径上，文件态没有这道闸 |
 | `llm_admin_app_crud_and_persistence` | `llm/admin` apps 端点表 + `config.rs` 持久化 | app CRUD、合并式 PUT（models 列表替换）、key 自动生成 `sk-gw-...`、`apps.toml` 原子写回（重读断言落盘） |
+| `llm_usage_records_per_app_buckets` | ADR-L20（按日 × 应用账本）+ `llm/forward` 后置第 14 步 | openai 非流式响应的四桶（`prompt_tokens` 含 cached 时 input 归一减去）、`total` = 四桶之和；app 维度独立记账（两个 app 各自累加、互不串）；无凭证请求单列为 `app: null` 条目 |
+| `llm_usage_records_anthropic_cache_buckets` | ADR-L20（跨协议桶对齐）+ `extract_usage` anthropic 契约 | `input_tokens` → `input`、`output_tokens` → `output`、`cache_read_input_tokens` → `cache_read`、`cache_creation_input_tokens` → `cache_write` |
+| `llm_usage_records_from_streaming_final_chunk` | `extract_usage` SSE 契约 | openai SSE 多个 `data:` 块的 usage 聚合；anthropic SSE 取首个 input/cache 值 + 末个累计 output |
+| `llm_usage_view_filters_by_app_date_range` | `llm/admin` usage 端点表 | `app` / `date` / `from`/`to`（闭区间）过滤AND；返回按 `(date, app)` 升序、无凭证条目同日最前；非法日期参数（`not-a-date` / `26-11-06`）→ 400 |
+| `llm_usage_ledger_flush_writes_and_reloads` | ADR-L20/L21 + `load_usage`/`save_usage` 后置 | flush 后 `usage.toml` 存在且 round-trip；另一进程（新网关）启动加载后 `/__admin/llm/usage` 可见历史 |
+| `llm_usage_ledger_clean_no_op` | `flush_if_dirty` 后置（不 dirty 不写盘） | 无流量时 flush 不创建文件 / 不改动现有文件（钉住「flush 不是无脑周期写」） |
+| `llm_usage_records_systemone_zero_buckets` | ADR-L8/L20 桩契约（账本侧同构） | systemone 流量条目存在但四桶恒 0（账本不因桩产生虚假用量） |
 | `llm_legacy_provider_without_models_still_works` | ADR-L14 兜底兼容契约 | 无模型表的历史 provider 配置（`provider()` helper）在带 model 的请求下仍可路由——向后兼容回归 |
 | `llm_example_configs_parse_and_validate` | 示例配置维护条目（非 SDD 契约，见 `examples/README.md`） | `examples/` 两个 LLM 示例 TOML 经真实 `load_providers`/`load_apps` 解析与 `validate` 通过；分层（priority 10/1）、按供应商超时、按供应商代理、组合引用已声明模型的演示不变式成立——防示例文档随代码演进腐坏 |
 

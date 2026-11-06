@@ -50,8 +50,10 @@ Persistence (`src/config.rs`): every admin mutation calls `AppState::persist`
 changes) or `persist_bots` (bot changes), which serializes the whole table to
 TOML and replaces the file atomically (temp file in the same directory +
 `persist`). **Rewrites drop comments** — the managed header line is the only
-comment that survives. A missing routes, providers, apps or bots file at startup
-is not fatal: the gateway starts with none.
+comment that survives. A missing routes, providers, apps, bots or usage file at
+startup is not fatal: the gateway starts with none. The LLM usage ledger is
+**not** an admin-mutation persistence target: `UsageLedger::flush_if_dirty`
+writes it periodically and at shutdown (see LLM paragraph below).
 
 Health (`src/health.rs`): background task probes `upstream + health_path` every
 `GATEWAY_HEALTH_INTERVAL_SECS`; the first sweep runs immediately after boot rather
@@ -104,7 +106,17 @@ Per-provider `timeout_secs` overrides `GATEWAY_DEFAULT_TIMEOUT_SECS` (ADR-L17).
 TPM is counted *after the fact* from the response tail: a `UsageTap` stream
 copies chunks into a 64 KiB `TailBuffer` while streaming them to the client and
 extracts `usage` exactly once on stream end / upstream error / consumer drop;
-extraction is best-effort and never fails (missing usage records 0). `systemone`
+extraction is best-effort and never fails (missing usage records 0). The same
+tap also records a per-day × app token ledger (`src/llm/ledger.rs`, ADR-L20):
+`extract_usage` splits usage into `input`/`output`/`cache_read`/`cache_write`
+buckets normalized across protocols, aggregated by `(UTC date, app id)` in a
+`UsageLedger` (no-credential traffic enters with an empty-string app, exposed
+as `null`); it is queried read-only via `GET /__admin/llm/usage`
+(`app`/`date`/`from`/`to` filters, invalid dates → 400) and persisted full-write
+to `GATEWAY_USAGE_FILE` (default `usage.toml`) by a periodic flush task
+(`GATEWAY_USAGE_FLUSH_SECS`, default 60) plus one final flush on shutdown —
+SIGKILL loses the last flush window (R15). The ledger is decoupled from quota:
+`extract_tokens` is unchanged and TPM semantics are untouched. `systemone`
 is reachable only via the explicit segment and its usage extraction is a
 deliberate stub (always 0) — routing and forwarding work, accounting does not.
 `docs/sdd/llm/interfaces.md` is the implementation authority for this module.

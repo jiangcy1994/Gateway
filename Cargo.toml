@@ -1,6 +1,6 @@
 [package]
 name = "top-gateway"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Top-level gateway: mounts sub-gateways under path prefixes, forwards traffic, and exposes an admin REST API for routing, health, and metrics"
 license = "MIT"

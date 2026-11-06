@@ -637,6 +637,8 @@ mod tests {
             providers_file: "providers.toml".into(),
             bots_file: "bots.toml".into(),
             apps_file: "apps.toml".into(),
+            usage_file: "usage.toml".into(),
+            usage_flush_secs: 60,
             health_interval_secs: 60,
             health_timeout_secs: 5,
             default_timeout_secs: 15,

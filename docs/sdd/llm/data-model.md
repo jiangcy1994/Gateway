@@ -2,7 +2,7 @@
 
 > **SDD 第 3 步**：核心类型与不变式。依赖第 2 步的模块划分——类型绝不超出架构边界。
 
-数据模型分三层：**配置值对象**（`Protocol` / `Model` / `Provider` / `ProviderPatch` / `App` / `AppPatch`）、**运行期状态**（`ProviderTable` / `AppTable` / `QuotaTracker` / `TailBuffer`）、**观测快照**（`QuotaSnapshot`）。
+数据模型分三层：**配置值对象**（`Protocol` / `Model` / `Provider` / `ProviderPatch` / `App` / `AppPatch`）、**运行期状态**（`ProviderTable` / `AppTable` / `QuotaTracker` / `UsageLedger` / `TailBuffer`）、**观测快照**（`QuotaSnapshot` / `UsageEntry`）。
 
 ## 核心枚举：`Protocol`（provider.rs）
 
@@ -147,6 +147,35 @@ TailBuffer { buf: Vec<u8>, cap: usize }   // cap = 64 KiB
 - `push(chunk)`：追加后若超过 cap，**从前截断**（保留尾部）。
 - 提取时只看尾部：非流式 JSON 的 `usage` 在包尾；SSE 的 usage 在最后几个 `data:` 块。
 
+### `Usage`（usage.rs，ADR-L20）
+
+跨协议对齐的 token 分桶明细（`input` / `output` / `cache_read` / `cache_write`，均 `u64`，`Default` = 全 0）。`total = input + output + cache_read + cache_write`（由 `total()` 计算，不存字段）。归一化规则（提取时应用，见 `interfaces.md`）：
+
+| 协议 | input | output | cache_read | cache_write |
+|---|---|---|---|---|
+| openai | `prompt_tokens - cached_tokens`（saturating） | `completion_tokens` | `prompt_tokens_details.cached_tokens` | 恒 0（上游无此字段） |
+| anthropic | `input_tokens`（本就不含缓存） | `output_tokens` | `cache_read_input_tokens` | `cache_creation_input_tokens` |
+| systemone | 恒 0（桩，ADR-L8/L20） | 同左 | 同左 | 同左 |
+
+- **不变式 P15**：`Usage` 的四桶**互不重叠**且覆盖 `extract_tokens` 所计总数的主要来源——openai 的 `reasoning_tokens` 属 `output` 子集，不单列（R16）；anthropic 的 `cache_read`/`cache_write` 属 input 侧的配套计费，不计入 `input`。
+- **不变式 P16**：`Usage` 只由 `extract_usage` 从上游响应尾包产出；无 usage / 解析失败 / 流被中断 → 全 0（best-effort，与 R1 同源）。
+
+### `UsageLedger`（ledger.rs，ADR-L20）
+
+```rust
+UsageLedger {
+    inner: RwLock<BTreeMap<(NaiveDate, String), Usage>>,   // key: (日期 UTC, app id；无凭证 = "")
+    dirty: AtomicBool,
+}
+```
+
+- 主键是 **(UTC 日期, app id)**：`record` 在响应记账时以 `Utc::now().date_naive()` 取当天日期——**日期按记账时刻而非请求开始时刻**，跨日界还在飞的响应记到新的一天。
+- 无凭证流量（默认策略，app = None）以空串 app 入账；**在视图边界转回 `None`**（TOML 行内 `app = ""`，JSON 响应里 `app: null`）——空串只是存储哨兵，不是可配置的 app id。
+- 聚合维度为 app 而非供应商：账本回答「哪个应用哪天用了多少 token」，与配额（供应商维度）正交；同一响应不会被按供应商再记一份。
+- `BTreeMap` 天然按 `(date, app)` 排序——admin 视图与落盘顺序即 map 迭代序，无需另排。
+- dirty 位：`record` 置位，`flush_if_dirty` 落盘后清除；**flush 任务只在 dirty 时写盘**，空闲窗口不做无谓 IO。
+- 并发：`record` 只持有 ledger 写锁（在 `UsageTap::finish` 中、quota 记账之后，**不与任何 quota 锁嵌套**）；`flush_if_dirty` 取读锁快照后在锁外序列化——flush 与 record 可以交错，但 dirty 仍在，**不丢条目，只可能延迟一个 flush 窗口**。
+
 ## 观测快照（`QuotaSnapshot`，序列化形态）
 
 `GET /__admin/llm/quota` 的每条记录：
@@ -159,7 +188,18 @@ TailBuffer { buf: Vec<u8>, cap: usize }   // cap = 64 KiB
 
 `GET /__admin/llm/metrics` 每条 = `Provider` + `RouteStats::snapshot()`（与 `/__admin/metrics` 的 stats 形态完全一致）。
 
-## 持久化形态
+## 观测快照（`UsageEntry`，序列化形态，ADR-L20）
+
+`GET /__admin/llm/usage` 的每条记录，同时是 `usage.toml` 的行结构：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `date` | `String`（`YYYY-MM-DD`） | UTC 日期；字符串形态规避 toml 对 chrono feature 的要求 |
+| `app` | `Option<String>` | 应用 id；`None` = 无凭证流量（存储哨兵为空串，见 P15/P16） |
+| `input` / `output` / `cache_read` / `cache_write` | `u64` | 分桶明细 |
+| `total` | `u64` | 各桶之和；**序列化时填入、反序列化时忽略**（以桶为准，兼容手工编辑） |
+
+## 持久化形态（providers.toml）
 
 ```toml
 # top-gateway providers - managed file, rewrites drop comments
@@ -204,6 +244,31 @@ models = []            # 空表 = 不限制（默认策略）
 
 `AppsFile { apps: Vec<App> }`；缺文件非致命、原子写、重写丢注释——与 providers 文件完全同构。
 
+## 持久化形态（usage.toml，ADR-L20）
+
+```toml
+# top-gateway usage - managed file, rewrites drop comments
+[[usage]]
+date = "2026-11-05"
+app = "cli-code"       # 无凭证流量此行为空串
+input = 12340
+output = 890
+cache_read = 2100
+cache_write = 0
+total = 15330
+
+[[usage]]
+date = "2026-11-06"
+app = ""
+input = 500
+output = 120
+cache_read = 0
+cache_write = 0
+total = 620
+```
+
+`UsageFile { usage: Vec<UsageEntry> }`；缺文件非致命、原子写、重写丢注释；**全量写**（不做增量追加）。加载时 `(date, app)` 重复行合并累加；`total` 反序列化时忽略。**这是观测数据而非配置**：没有任何管理 API 能写它，唯一的写入者是 flush 任务与 shutdown flush（手工编辑可读，但会在下次落盘时被覆盖）。
+
 ## 数据流上的形态
 
 ```
@@ -224,5 +289,9 @@ apps.toml ──load_apps──→ Vec<App> ──set_all──→ AppTable
 Provider.proxy_url ──ClientCache.get──→ forward（选 client：None = 共享直连，Some = 按代理复用）
 选择/派遣 ──同一临界区──→ QuotaTracker.requests（RPM 计数）
 响应流 tap ──TailBuffer→ extract_tokens ──→ QuotaTracker.tokens（TPM 记账）
+                └──────→ extract_usage ──→ UsageLedger.record(app_id, 当日 UTC, Usage)
+UsageLedger ──snapshot + UsageFilter──→ /__admin/llm/usage（只读，不写盘）
+UsageLedger ──flush_if_dirty（周期任务 / shutdown）──→ usage.toml（全量原子写回）
+usage.toml ──load_usage──→ Vec<UsageEntry> ──set_all──→ UsageLedger（启动恢复）
 QuotaTracker / RouteStats ──快照──→ /__admin/llm/quota · /__admin/llm/metrics
 ```

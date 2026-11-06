@@ -165,6 +165,66 @@ Selection { provider: Provider, upstream_model: Option<String> }
 - `"usage"` 键定位：逐字节查找带引号字面量，其后跳过空白与 `:`，以花括号深度计数（含字符串状态机）截取完整 JSON 对象后反序列化；失败则继续找下一个出现位置。
 - SSE 行解析：只处理以 `data:` 开头的行，去掉前缀与一个可选空格；跨缓冲区边界的截断行解析失败即跳过（尾包保留的是流末尾，用法块总在末尾完整）。
 
+### `Usage`（结构体，ADR-L20）
+
+token 分桶明细，供 ledger 记账。**best-effort，永不失败**；`total` 恒等于各桶之和。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `input` | `u64` | 输入（prompt）token |
+| `output` | `u64` | 输出（completion）token |
+| `cache_read` | `u64` | 命中缓存被读取的 token（openai `prompt_tokens_details.cached_tokens`；anthropic `cache_read_input_tokens`） |
+| `cache_write` | `u64` | 写入缓存的 token（anthropic `cache_creation_input_tokens`；openai 无对应字段，恒 0） |
+
+- `Default` = 全 0（`Usage::default()`）。
+- 桶划分**跨协议对齐**：同一字段名在两种协议下语义一致（openai 的 `prompt_tokens` 含 cached，取数时先减去 `cached_tokens` 归一到 `input`；anthropic 的 `input_tokens` 本就不含缓存）。
+- `reasoning_tokens`（openai 的 `completion_tokens_details`）**不计入任何桶**：它是 `output` 的子集而非独立桶，单列会造成重复计数（风险 R16）。
+- systemone 的 `extract_usage` 与 `extract_tokens` 同为**桩：恒为全 0**（ADR-L8 的同构扩展，ADR-L20）。
+
+### `extract_usage(protocol, content_type: Option<&str>, tail: &[u8]) -> Usage`
+
+从响应尾包提取分桶明细。与 `extract_tokens` 同流的 best-effort 契约（解析不到返回全 0），但**记账维度不同**：本函数返回分桶明细供 ledger 记账，`extract_tokens` 返回总数供 TPM 配额记账。两函数各自独立、互不影响——TPM 配额语义（含「`total_tokens` 优先」规则）保持不变。
+
+| 协议 | `content-type` 含 `text/event-stream` | 其余（JSON 等） |
+|---|---|---|
+| openai | 逐行取 `data:` 前缀的 JSON，汇总所有含 `usage` 对象的块 | 从尾包找最后一个 `"usage"` 键，取其 JSON 对象 |
+| anthropic | 汇总所有含 `usage` 的块：`input`/`cache_read`/`cache_write` 取**首个出现的值**，`output` 取**最后出现的值**（累计值语义，与 `extract_tokens` 同规则） | 同左（非流式响应只有一个 usage） |
+| systemone | **桩：恒全 0**（ADR-L8/L20） | 同左 |
+
+openai 取数规则：`input = prompt_tokens - prompt_tokens_details.cached_tokens`（`cached_tokens` 缺省 0，减法用 `saturating_sub`）；`output = completion_tokens`；`cache_read = prompt_tokens_details.cached_tokens`；`cache_write` 恒 0。`prompt_tokens` 或 `completion_tokens` 缺失的块按该桶 0 处理（存在的桶仍计入）。
+
+anthropic 取数规则：`input = input_tokens`、`output = output_tokens`、`cache_read = cache_read_input_tokens`（缺省 0）、`cache_write = cache_creation_input_tokens`（缺省 0）；四个字段全缺的 usage 对象按全 0 计。
+
+---
+
+## ledger.rs（新增，ADR-L20）
+
+### `UsageLedger`（结构体）
+
+按**日（UTC）× 应用**聚合 token 用量的账本，与 `QuotaTracker` 并列的运行期状态。
+
+构造：`UsageLedger::new()`。
+
+| 方法 | 签名 | 调用方 | 后置 / 错误 |
+|---|---|---|---|
+| `record` | `(&self, app: Option<&str>, date: NaiveDate, usage: Usage)` | forward 的 usage tap | 以 `(date, app)` 为主键合并累加各桶；锁中毒 panic（与 `RouteTable` 同策略）；`app = None`（无凭证）记为空串键 |
+| `snapshot` | `(&self, filter: UsageFilter) -> Vec<UsageEntry>` | admin | 按 filter 过滤后按 `(date, app)` **升序**返回克隆；`app` 空串键在视图边界转成 `None` |
+| `flush_if_dirty` | `(&self, path: &Path) -> Result<(), ApiError>` | flush 任务 / shutdown | dirty 时全量序列化落盘（原子写）并清 dirty；不 dirty 时 **no-op 不写文件**；序列化/写盘失败 → `Persist`（500） |
+
+- 并发：内部 `RwLock<BTreeMap<(NaiveDate, String), Usage>>` + `AtomicBool dirty`。`record` 只取写锁、**不持有任何 quota 锁**（在 `UsageTap::finish` 里于 quota 记账之后调用）；`flush_if_dirty` 取读锁快照后释放，序列化在锁外进行。
+- 并发不变式：flush 与 record 可以交错（快照后再记的条目不在本次落盘内容里，但 dirty 仍置位，下一次 flush 会带上）——**不丢条目，只可能延迟一个 flush 窗口**。
+- `UsageFilter`：`{ app: Option<String>, date: Option<NaiveDate>, from: Option<NaiveDate>, to: Option<NaiveDate> }`，全部可选；过滤语义为 AND（`app` 精确匹配，`date` 精确匹配，`from`/`to` 闭区间）。
+
+### `UsageEntry`（序列化形态）
+
+`record` 的视图投影，也是 admin 响应与持久化 TOML 的共享行结构。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `date` | `String`（`YYYY-MM-DD`） | UTC 日期；序列化为字符串以避开 toml 对 chrono 的 feature 要求 |
+| `app` | `Option<String>` | 应用 id；`None` = 无凭证流量（默认策略）；TOML 行内为空串 |
+| `input` / `output` / `cache_read` / `cache_write` / `total` | `u64` | `total` 序列化时由各桶求和填入，反序列化时**忽略**（以各桶为准，兼容手工编辑） |
+
 ---
 
 ## client.rs（新增，ADR-L19）
@@ -209,7 +269,7 @@ Selection { provider: Provider, upstream_model: Option<String> }
   11. **选择 HTTP client**（ADR-L19）：`provider.proxy_url` 为 `None` → 用共享直连 client（`state.client`）；`Some(url)` → 向 `state.llm_clients` 按 url 取（缺则构建 `reqwest::Client::builder().proxy(Proxy::all(url))` 并缓存）**直连/代理 client 均复用连接池**。构建失败 → `500`（`ApiError::Internal`；`validate` 已拦过绝大多数非法 url，此处是防御性兜底）。
   12. 超时 = `provider.timeout_secs.unwrap_or(settings.default_timeout_secs)`（ADR-L17）包裹 `send()`：传输错误 → `502`（消息含 provider id）；超时 → `504`；均 `record_error()`。**超时包裹与 client 选择无关**——换 client 不改变超时语义。
   13. 响应头：剥 hop-by-hop + `content-length`；**注入 `x-llm-provider: <provider id>`**。
-  14. body：`Body::from_stream(usage tap)`——每块向客户端转发的同时复制进 `TailBuffer`；流正常结束 / 上游流出错 / **消费者断开** 三种情形都触发一次 `extract_tokens → record_tokens`（互斥，只记一次）。**请求 body 不流式（已缓冲），响应 body 仍流式**。
+  14. body：`Body::from_stream(usage tap)`——每块向客户端转发的同时复制进 `TailBuffer`；流正常结束 / 上游流出错 / **消费者断开** 三种情形都触发一次（互斥，只记一次）：先 `extract_tokens → record_tokens`（TPM 配额），再 `extract_usage → ledger.record(app_id, today, usage)`（ADR-L20）。**请求 body 不流式（已缓冲），响应 body 仍流式**。
   15. 上游 5xx：状态与 body 原样透传，同时计一次错误；4xx 原样透传不计错误。
 - 错误体：全部使用 `proxy::error_response` 的 house 格式。
 - 常量：`pub const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;`
@@ -234,6 +294,7 @@ Selection { provider: Provider, upstream_model: Option<String> }
 | GET | `/__admin/llm/apps/{id}` | `200` + 单应用（含 `key`） | 404、401 |
 | PUT | `/__admin/llm/apps/{id}` | `200` + 合并后的应用 | 400、404、401 |
 | DELETE | `/__admin/llm/apps/{id}` | `200 {"deleted":<id>}` | 404、401 |
+| GET | `/__admin/llm/usage` | `200 {"usage":[UsageEntry...]}`，全部可选 query 参数（见下） | 400（非法日期格式）、401 |
 
 - 所有供应商变更端点成功后先 `state.persist_providers()`，应用变更端点先 `state.persist_apps()`，再返回；持久化失败 → 500。
 - GET（列表与单项）返回的供应商 JSON **总是带 `proxy_url` 键**：未配置时为 `null`（与 `rpm_limit`/`tpm_limit`/`timeout_secs` 同构）——对 0.2.2 之前的消费者是纯新增键，不影响既有解析。
@@ -241,6 +302,21 @@ Selection { provider: Provider, upstream_model: Option<String> }
 - `ProviderPatch`（PUT body）：全 Option，与 `RoutePatch` 同构的合并语义。**`rpm_limit` / `tpm_limit` 为 `Option<Option<u64>>`**：字段缺省 = 保留原值；显式 `null` = 设为不限；数字 = 设新限额。`protocols` 为 `Option<Vec<Protocol>>`：缺省或显式 `null` = 保留原值；给列表（或单值）= 整体替换。`models` 为 `Option<Vec<Model>>`：缺省 / 显式 `null` = 保留原表；给列表 = 整体替换（`[]` = 清空，回到兜底）。`timeout_secs` 为 `Option<Option<u64>>`：缺省 = 保留；显式 `null` = 回落全局默认；数字 = 设新值。`proxy_url` 为 `Option<Option<String>>`：缺省 = 保留原值；显式 `null` = 清除代理（回到共享直连 client）；字符串 = 设新代理（同样要过 `validate` 的 P14 校验）。
 - `AppInput`（POST body）：`id`/`name` Option，`key` Option（省略生成），`models` Option（省略 = 不限制），`enabled` Option；无必填字段（全缺省成一个启用、不限模型的 app，id/key 自动生成）。**省略（`None`/缺字段）= 自动生成；显式空串或纯空白 = 非法，`validate` 判 400**（`InvalidApp` 由此可达，与 `Provider` 的「空 id → 400」一致）。
 - `AppPatch`（PUT body）：全 Option 合并语义；`models` 为 `Option<Vec<String>>`（缺省 / `null` = 保留；列表 = 替换；`[]` = 改为不限制）。
+
+### `GET /__admin/llm/usage` 查询参数（ADR-L20）
+
+全部可选，过滤语义为 AND：
+
+| 参数 | 格式 | 语义 |
+|---|---|---|
+| `app` | 应用 id 字符串 | 精确匹配；不可用于匹配无凭证流量（无凭证条目无 app id） |
+| `date` | `YYYY-MM-DD` | 精确匹配单日 |
+| `from` | `YYYY-MM-DD` | 闭区间起点 |
+| `to` | `YYYY-MM-DD` | 闭区间终点 |
+
+- 日期解析用 `NaiveDate::parse_from_str(s, "%Y-%m-%d")`，且解析成功后再按同一格式回写比对原串——`%Y` 单独接受 1-4 位年份（`"26-11-06"` 会解析成 0026 年），只有规范 4 位年份的入串合法；任一参数格式或形态非法 → `400 InvalidUsageQuery`（消息含参数名与原值）。
+- 无参数 = 全量。返回按 `(date, app)` 升序；`app` 缺失的条目（无凭证流量）排在同日内最前。
+- 只读端点：不写盘、不清 dirty（落盘由 flush 任务与 shutdown 负责）。
 
 ---
 
@@ -252,6 +328,8 @@ Selection { provider: Provider, upstream_model: Option<String> }
 |---|---|---|---|
 | `GATEWAY_PROVIDERS_FILE` | `providers_file: PathBuf` | `providers.toml` | 供应商配置文件 |
 | `GATEWAY_APPS_FILE` | `apps_file: PathBuf` | `apps.toml` | 应用（模型组合）配置文件（ADR-L18） |
+| `GATEWAY_USAGE_FILE` | `usage_file: PathBuf` | `usage.toml` | 用量账本持久化文件（ADR-L20） |
+| `GATEWAY_USAGE_FLUSH_SECS` | `usage_flush_secs: u64` | `60` | 账本 flush 周期秒数（ADR-L20；`0` = 不启用周期 flush，仅 shutdown 落盘） |
 
 ### `load_providers(path: &Path) -> Result<Vec<Provider>, ApiError>`
 
@@ -271,9 +349,21 @@ Selection { provider: Provider, upstream_model: Option<String> }
 
 - 后置：pretty TOML + 固定托管头注释；同名目录临时文件 + rename 原子替换；**重写丢注释**（与 `save_providers` 同构）。`key` 明文落盘（与 `api_key` 同策略，ADR-L11）。
 
+### `load_usage(path: &Path) -> Result<Vec<UsageEntry>, ApiError>`（新增，ADR-L20）
+
+- 后置：文件不存在 → `Ok(vec![])` 并告警（非致命，与 `load_routes` 同策略）；解析失败 → `ConfigLoad`（500）。
+- 同一 `(date, app)` 出现多行时**合并累加**（文件被手工编辑出重复行也收敛），合并后按 `(date, app)` 排序。
+- 不跑任何 `validate`：用量文件是网关自己写的观测数据，没有配置面语义。
+
+### `save_usage(path: &Path, entries: &[UsageEntry]) -> Result<(), ApiError>`（新增，ADR-L20）
+
+- 后置：pretty TOML + 固定托管头注释；同名目录临时文件 + rename 原子替换；**重写丢注释**。
+- 全量写：不做增量追加（账本规模为 日 × 应用 数，全量写的代价可接受，且避免追加文件与 compaction 的复杂度）。
+
 ### `run`（lib.rs）变更
 
-- 启动顺序：`load_routes` → `load_providers` → `load_apps` → 三个 `set_all`；三者都缺失不致命。
+- 启动顺序：`load_routes` → `load_providers` → `load_apps` → `load_usage` → 四个 `set_all`；四者都缺失不致命。
+- 启动后按 `usage_flush_secs` spawn 周期 flush 任务（dirty 时才写盘）；`axum::serve` 结束（shutdown）后执行**最后一次 flush**，进程被 SIGKILL 强杀时丢失最近一个 flush 窗口（风险 R15）。
 - `build_app` 新增 `nest("/llm", llm::llm_router())`，位于 admin nest 与 proxy fallback 之间；`/llm` 前缀保留（nest 优先于 fallback）。
 
 ---
@@ -297,6 +387,7 @@ Selection { provider: Provider, upstream_model: Option<String> }
 | `AppNotFound(id)` | 404 | GET/PUT/DELETE 未知 app id |
 | `RequestBodyTooLarge` | 413 | 请求 body 超过 `MAX_REQUEST_BODY`（16 MiB） |
 | `Internal(msg)` | 500 | 运行时构建代理 client 失败（ADR-L19；`validate` 已拦绝大多数非法 `proxy_url`，此为防御性兜底） |
+| `InvalidUsageQuery(msg)` | 400 | `/__admin/llm/usage` 的 `date`/`from`/`to` 参数不是 `YYYY-MM-DD` 格式（消息含参数名与原值） |
 
 `QuotaExhausted` 的消息从「protocol 名」改为「携带 model 信息的可读串」（有 model 时含 model 名）；无 model 时保持原语义（协议名）。错误体格式不变（house 格式）。
 

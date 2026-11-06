@@ -12,10 +12,11 @@ LLM 子网关是 top-gateway 内嵌模块，代码在 `src/llm/`，与既有模�
 | `llm/app.rs` | `App` 值对象（应用凭证 → 模型组合）、`AppInput`/`AppPatch`、`AppTable`（与 `ProviderTable` 同构）；key 比较用常量时间 | `error.rs`（`constant_time_eq` 复用自 `admin.rs`） |
 | `llm/quota.rs` | `QuotaTracker`：供应商级 60s 滚动窗口的 RPM/TPM 计数与剩余量 | 无（纯内存 + `Mutex`） |
 | `llm/balancer.rs` | `select_and_record`：按协议 + 模型过滤候选 → **优先级分层** → 层内加权随机 → **同临界区记 RPM**，返回 `Selection { provider, upstream_model }` | `provider.rs`、`quota.rs`、`state.rs` |
-| `llm/usage.rs` | `TailBuffer`（尾部缓冲）+ `extract_tokens`：从响应尾包按协议提取 token 数 | `provider.rs`（`Protocol`） |
+| `llm/usage.rs` | `TailBuffer`（尾部缓冲）+ `Usage` 分桶值对象 + `extract_tokens`（TPM 配额用）/ `extract_usage`（账本用，跨协议归一） | `provider.rs`（`Protocol`） |
+| `llm/ledger.rs`（新增，ADR-L20/L21） | `UsageLedger`：`(UTC 日期, app id)` 主键的 `BTreeMap` 分桶账本，`record` / `snapshot`（视图边界空串 → `app: null`）/ `set_all`（启动加载）/ `flush_if_dirty`（dirty 才全量原子写），`spawn_flush` 周期落盘任务 | `usage.rs`（`Usage`）、`error.rs`、`config.rs`（`save_usage`/`load_usage`）、`state.rs` |
 | `llm/client.rs`（新增，ADR-L19） | `ClientCache`：按 `proxy_url` 复用自带连接池的 reqwest client（每个代理 url 一个）；`None` 永远映射到共享直连 client | `error.rs`（构建失败 → `Internal`） |
 | `llm/forward.rs` | `/llm/*` 转发处理器：解析两种入站形态、app 解析、请求 body 缓冲与 `model` 提取 / 改写、按供应商选 client（直连 / 代理）、按供应商超时、鉴权头注入、流式转发、usage 记账 tap | 以上全部 + `proxy.rs` 的 `error_response` |
-| `llm/admin.rs` | `/__admin/llm/*` 端点（供应商 CRUD / 应用 CRUD / 配额 / 指标），复用 `require_admin` | `provider.rs`、`app.rs`、`state.rs`、`metrics.rs` |
+| `llm/admin.rs` | `/__admin/llm/*` 端点（供应商 CRUD / 应用 CRUD / 配额 / 指标 / 用量查询），复用 `require_admin` | `provider.rs`、`app.rs`、`ledger.rs`（`UsageFilter`/快照）、`state.rs`、`metrics.rs` |
 
 ## 请求流程
 
@@ -70,20 +71,29 @@ forward handler（llm/forward.rs）
 12. 响应头：剥 hop-by-hop / content-length；附 x-llm-provider: <id>
 13. 响应 body：Body::from_stream(usage tap)
       └─ tap 每块复制进 TailBuffer（保留最后 64KiB），
-         流结束 / 出错 / 消费者断开时 extract_tokens → quota.record_tokens
+         流结束 / 出错 / 消费者断开时（互斥一次）：
+         先 extract_tokens → quota.record_tokens（TPM 配额），
+         再 extract_usage → ledger.record(app_id, 当日 UTC, 分桶)（ADR-L20）
 14. 上游 5xx → record_error 后原样透传
-11. 响应头：剥 hop-by-hop / content-length；附 x-llm-provider: <id>
-12. 响应 body：Body::from_stream(usage tap)
-      └─ tap 每块复制进 TailBuffer（保留最后 64KiB），
-         流结束 / 出错 / 消费者断开时 extract_tokens → quota.record_tokens
-13. 上游 5xx → record_error 后原样透传
 ```
 
 权重（第 5 步）：对每个有限额维度取剩余比例，取两者最小值；未设限额的维度按 1.0。分层只在请求带 `model` 时生效；无 `model` 请求（含兜底场景）全员 effective priority = 0，即退化为此前的扁平加权随机（ADR-L4 语义保留）。
 
 ### 管理请求（`/__admin/llm/*`）
 
-挂载在既有 `admin_router()` 内（`nest("/llm", llm::admin_router())`），鉴权复用 `require_admin`（同一下 `X-Admin-Key` / `Bearer` 密钥）。供应商变更端点成功后调 `state.persist_providers()`，应用变更端点调 `state.persist_apps()`——两者与路由持久化同构（同目录临时文件 + rename，托管头注释，重写丢注释）。
+挂载在既有 `admin_router()` 内（`nest("/llm", llm::admin_router())`），鉴权复用 `require_admin`（同一下 `X-Admin-Key` / `Bearer` 密钥）。供应商变更端点成功后调 `state.persist_providers()`，应用变更端点调 `state.persist_apps()`——两者与路由持久化同构（同目录临时文件 + rename，托管头注释，重写丢注释）。`GET /__admin/llm/usage` 是**只读**端点：取 `UsageLedger` 快照按 `(date, app)` 升序返回，可选过滤参数 `app` / `date` / `from` / `to`（非法日期 → 400 `InvalidUsageQuery`），不触发写盘（ADR-L20）。
+
+### 账本生命周期（`ledger.rs`，ADR-L20/L21）
+
+```
+启动：load_usage(usage.toml) → set_all（缺文件非致命）
+       └─ spawn 周期 flush 任务：每 GATEWAY_USAGE_FLUSH_SECS 秒
+          flush_if_dirty —— dirty 才写盘（全量原子写），否则 no-op
+请求：UsageTap::finish （配额记账之后）→ ledger.record(app_id, Utc 当日, Usage)
+关停：axum::serve graceful shutdown 之后 → 末次 flush_if_dirty
+```
+
+与配额路径的关系：ledger 是**并行的新记账路径**，`extract_tokens`（TPM 配额）逐字不变；ledger 的锁（`RwLock<BTreeMap>`）不与任何 `QuotaTracker` 的 `Mutex` 嵌套——`finish` 里先记配额再记账本。日期取**记账时刻**的 UTC 日期（跨日界还在飞的响应记到新的一天）。
 
 ## 与 top-gateway 既有行为的关系
 

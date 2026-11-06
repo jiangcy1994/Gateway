@@ -76,6 +76,8 @@ async fn spawn_qq_gateway(default_timeout_secs: u64) -> QqGateway {
         providers_file: providers_path,
         bots_file: bots_path.clone(),
         apps_file: apps_path.clone(),
+        usage_file: dir.path().join("usage.toml"),
+        usage_flush_secs: 60,
         health_interval_secs: 600,
         health_timeout_secs: 2,
         default_timeout_secs,

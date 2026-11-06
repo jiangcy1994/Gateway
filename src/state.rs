@@ -6,6 +6,7 @@ use crate::error::ApiError;
 use crate::health::HealthState;
 use crate::llm::app::AppTable;
 use crate::llm::client::ClientCache;
+use crate::llm::ledger::UsageLedger;
 use crate::llm::provider::ProviderTable;
 use crate::llm::quota::QuotaTracker;
 use crate::metrics::RouteStats;
@@ -27,6 +28,8 @@ pub struct AppState {
     pub routes: RouteTable,
     pub providers: ProviderTable,
     pub apps: AppTable,
+    /// 按日 × 应用的 LLM 用量账本（ADR-L20），周期 flush 到 `settings.usage_file`。
+    pub llm_usage: UsageLedger,
     pub bots: BotTable,
     pub bot_tokens: TokenStore,
     pub bot_ws: WsTable,
@@ -50,6 +53,7 @@ impl AppState {
             routes: RouteTable::default(),
             providers: ProviderTable::default(),
             apps: AppTable::default(),
+            llm_usage: UsageLedger::new(),
             bots: BotTable::default(),
             bot_tokens: TokenStore::new(),
             bot_ws: WsTable::new(),
