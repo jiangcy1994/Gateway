@@ -91,7 +91,8 @@ cargo run --release
    还有 `weight > 0` 的成员（`weight = min(rpm 余量比例, tpm 余量比例)`），请求
    就在这一层内按 weight 加权随机——单成员即必然选中它。
 3. 主用层配额耗尽（weight 归零）→ 降层到 priority 1，用 `shared-fallback`；
-   两层都耗尽 → `429`（`QuotaExhausted`，house 错误体）。
+   两层都耗尽 → `429`（`QuotaExhausted`，house 错误体，附 `Retry-After` 头
+   给出最早可能恢复的秒数——advisory，非预约）。
 4. 选中后：`model` 被改写成 `chat-pro-2026-04`，注入 `shared-primary` 凭证，
    响应头回 `x-llm-provider: shared-primary` 便于排错。上游响应原样回吐，
    **不做反向改写**——响应 body 里的模型名仍是上游名（`chat-pro-2026-04`）。

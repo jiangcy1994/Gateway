@@ -114,8 +114,38 @@ systemone 不参与推断（只能经显式协议段 `/llm/systemone/...` 访问
 | `remaining_rpm` | `(&self, limit: Option<u64>) -> Option<u64>` | balancer | 先淘汰；`None` → `None`（不限）；`Some(l)` → `l.saturating_sub(used)` |
 | `remaining_tpm` | 同上 | balancer | 同上 |
 | `snapshot` | `(&self, id: &str, protocols: &[Protocol], enabled, rpm_limit, tpm_limit) -> QuotaSnapshot` | admin | 先淘汰；`used` = 窗口内条数 / token 和；`protocols` 为供应商声明的全部协议（多协议供应商只此一条记录） |
+| `lock` | `(&self) -> QuotaGuard<'_>` | balancer / forward / admin | **创建时即淘汰**窗口外记录；锁中毒 panic（与 `RouteTable` 同策略） |
 
-不变式（并发）：`Mutex` 永远按 **ProviderTable 表序**获取；`select_and_record` 把所有候选 tracker 的锁**一次性全部持有**后再算权重，期间不做任何 await。
+### `QuotaGuard`（`lock()` 的返回：已淘汰、持有期间一直有效的临界区句柄）
+
+| 方法 | 签名 | 调用方 | 后置 / 错误 |
+|---|---|---|---|
+| `rpm_used` | `(&self) -> u64` | balancer | 窗口内请求数（`requests.len()`，创建时已淘汰） |
+| `tpm_used` | `(&self) -> u64` | balancer | 窗口内 token 和 |
+| `record_request` | `(&mut self)` | balancer（**同一临界区内**） | 追加 `Instant::now()`；不再加锁、不再淘汰 |
+| `retry_after` | `(&self, rpm_limit: Option<u64>, tpm_limit: Option<u64>) -> Option<Duration>` | balancer（**429 路径，guard 仍全持有时**） | 该供应商「最早可能恢复」还需多久（ADR-L24）；语义见下 |
+
+### 恢复时长语义（`retry_after`，ADR-L24）
+
+- **返回 `Some` 的条件**：RPM、TPM 至少一个维度设了限额**且已耗尽**（`rpm_used >= rpm_limit` / `tpm_used >= tpm_limit`）。两维度都不限或都未耗尽 → `None`。`weight == 0`（429 的成因）意味着至少一维耗尽，故 429 时每个候选必返回 `Some`；池级聚合时对 `None` 防御性跳过。
+- **RPM 恢复瞬间**：耗尽即 `len >= limit`。恢复时刻 = 第 `len - limit` 条（0-based；`len == limit` 时即 `requests[0]`）离开窗口的瞬间——此后窗口内只剩 `limit - 1 < limit` 条：
+
+  ```
+  rpm_recovery = requests[len - limit] + WINDOW
+  ```
+
+- **TPM 恢复瞬间**：`sum >= limit` 时从最旧条目起逐条累加被淘汰量，直到剩余量首次 `< limit`——**触发该落点的那条**决定恢复瞬间（必终止：P4 保证 `limit > 0`，全部淘汰后剩余为 0）：
+
+  ```
+  tpm_recovery = tokens[i] + WINDOW，i = 最小的令 sum - Σ(tokens[0..=i]) < limit 的下标
+  ```
+
+- **供应商级 = max**：`weight = min(rpm_ratio, tpm_ratio)`，两维度都恢复才算恢复，故取较慢者；未耗尽的维度不参与。
+- **池级 = min**（balancer）：429 意味着**每个**候选都有耗尽维度，任一候选恢复即出现可调度对象（`weight > 0`），故取全部候选中的最早者。
+- **边界**：guard 创建时已淘汰窗口外条目，保留条目均满足 `now - entry < WINDOW`（严格小于，淘汰谓词为 `>=`），故恢复时刻恒在未来、`retry_after ∈ (0, WINDOW)`；`error.rs` 的 `ceil` + clamp `[1, 60]` 是**防御性格式化**，不承担语义。
+- **advisory 语义（最小退避下界，非预约）**：头值是「最早**可能**恢复」的时刻而非保留座位的承诺——并发请求可抢先占走刚空出的槽位（选择无排队，L6/L4/L16），在途请求的 token 回账也可能重新压满 TPM（与 R2 同源的时序缺口）。按头值**精确**重试的客户端仍可能再撞 429（风险 R19）；客户端应视其为最小退避下界，按「头值 + 抖动」退避。
+
+不变式（并发）：`Mutex` 永远按 **ProviderTable 表序**获取；`select_and_record` 把所有候选 tracker 的锁**一次性全部持有**后再算权重与 `retry_after`，期间不做任何 await。
 
 ---
 
@@ -138,11 +168,11 @@ Selection { provider: Provider, upstream_model: Option<String> }
   1. **候选收集**：`model == None` → `list_enabled_by_protocol(protocol)`（每个供应商 effective priority = 0，`upstream_model = None`）；`model == Some(m)` → `pool_for(protocol, m)`，空池时：`declares_model(m)` 为真 → `Err(NoProviderForModel(m))`（→ **503**）；为假 → `Err(ModelNotFound(m))`（→ **404**）。`model == None` 且池空 → `Err(NoProviderForProtocol(protocol))`（→ **503**，保持原语义）。
   2. 为每个候选取（缺则创建）`Arc<QuotaTracker>`，**按表序**全部加锁。
   3. 各供应商淘汰旧记录后算权重：`weight = min(rpm_ratio, tpm_ratio)`；未设限额的维度比例按 `1.0`；`weight == 0` 的供应商退出选择。
-  4. **分层（仅 `model == Some` 时，ADR-L16）**：按 effective priority **降序**分组；从高到低取第一个**存在 `weight > 0` 成员**的层；层内成员按 weight 加权随机。层内全 0 则看下一层；**所有层全 0** → `Err(QuotaExhausted(...))`（→ **429**，消息含 model）。
+  4. **分层（仅 `model == Some` 时，ADR-L16）**：按 effective priority **降序**分组；从高到低取第一个**存在 `weight > 0` 成员**的层；层内成员按 weight 加权随机。层内全 0 则看下一层；**所有层全 0** → `Err(QuotaExhausted(msg, retry_after))`（→ **429**，消息含 model）：`retry_after` = 全部候选 `guard.retry_after(rpm_limit, tpm_limit)` 的 **min**（第 2 步获取的 guard 仍全部持有——**同一临界区、零额外加锁**；ADR-L24，`None` 候选跳过）。
   5. `model == None` 时退化为扁平加权随机（无分层；全员 priority 0 同层）——即 ADR-L4 的原语义。
   6. 选中 → **同一锁内** `record_request()` → 返回 `Selection`（provider 克隆 + upstream_model）。
 - 错误：除上述变体不产生其他响应形态。
-- 并发：第 6 步的「选 + 记」处于同一临界区（所有候选 tracker 的锁一次性持有、期间无 await），并发请求不会重复选走只剩 1 RPM 的供应商——此不变式**不因分层改变**。
+- 并发：第 6 步的「选 + 记」处于同一临界区（所有候选 tracker 的锁一次性持有、期间无 await），并发请求不会重复选走只剩 1 RPM 的供应商——此不变式**不因分层改变**；429 的恢复时长计算（第 4 步）亦在该临界区内，不产生新的跨请求时序缺口。
 
 ---
 
@@ -167,7 +197,7 @@ Selection { provider: Provider, upstream_model: Option<String> }
 
 ### `Usage`（结构体，ADR-L20）
 
-token 分桶明细，供 ledger 记账。**best-effort，永不失败**；`total` 恒等于各桶之和。
+token 分桶明细，供 ledger 记账。**best-effort，永不失败**；`total` 恒等于各桶之和（**饱和**求和——极端 / 恶意上游值不回绕、不 panic，ADR-L22）。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -209,10 +239,10 @@ anthropic 取数规则：`input = input_tokens`、`output = output_tokens`、`ca
 |---|---|---|---|
 | `record` | `(&self, app: Option<&str>, date: NaiveDate, usage: Usage)` | forward 的 usage tap | 以 `(date, app)` 为主键合并累加各桶；锁中毒 panic（与 `RouteTable` 同策略）；`app = None`（无凭证）记为空串键 |
 | `snapshot` | `(&self, filter: UsageFilter) -> Vec<UsageEntry>` | admin | 按 filter 过滤后按 `(date, app)` **升序**返回克隆；`app` 空串键在视图边界转成 `None` |
-| `flush_if_dirty` | `(&self, path: &Path) -> Result<(), ApiError>` | flush 任务 / shutdown | dirty 时全量序列化落盘（原子写）并清 dirty；不 dirty 时 **no-op 不写文件**；序列化/写盘失败 → `Persist`（500） |
+| `flush_if_dirty` | `(&self, path: &Path) -> Result<(), ApiError>` | flush 任务 / shutdown | 先持 `flush_lock`（串行化所有 flush，见下）；dirty 时全量序列化落盘（原子写）并清 dirty；不 dirty 时 **no-op 不写文件**（锁内早退）；序列化/写盘失败 → `Persist`（500） |
 
-- 并发：内部 `RwLock<BTreeMap<(NaiveDate, String), Usage>>` + `AtomicBool dirty`。`record` 只取写锁、**不持有任何 quota 锁**（在 `UsageTap::finish` 里于 quota 记账之后调用）；`flush_if_dirty` 取读锁快照后释放，序列化在锁外进行。
-- 并发不变式：flush 与 record 可以交错（快照后再记的条目不在本次落盘内容里，但 dirty 仍置位，下一次 flush 会带上）——**不丢条目，只可能延迟一个 flush 窗口**。
+- 并发：内部 `RwLock<BTreeMap<(NaiveDate, String), Usage>>` + `AtomicBool dirty` + `Mutex<()>` flush 锁（ADR-L22）。`record` 只取写锁、**不持有任何 quota 锁**（在 `UsageTap::finish` 里于 quota 记账之后调用）；`flush_if_dirty` 持 `flush_lock` 全程（含写盘），其内在**同一把 map 写锁**里完成「快照 + 清 dirty」，序列化在锁外进行。
+- 并发不变式：`flush_lock` 串行化所有 flush（周期 flush × 末次 flush 互斥）；「清 dirty」与「快照」同锁同临界区，并发的 `record` 要么落在快照里（清位之前），要么在清位之后重新置位——**不存在「已记账但 dirty = false」的夹缝**。快照后新记的条目不在本次落盘内容里，但 dirty 已置位，下一次 flush 会带上——**不丢条目，只可能延迟一个 flush 窗口**。
 - `UsageFilter`：`{ app: Option<String>, date: Option<NaiveDate>, from: Option<NaiveDate>, to: Option<NaiveDate> }`，全部可选；过滤语义为 AND（`app` 精确匹配，`date` 精确匹配，`from`/`to` 闭区间）。
 
 ### `UsageEntry`（序列化形态）
@@ -223,7 +253,7 @@ anthropic 取数规则：`input = input_tokens`、`output = output_tokens`、`ca
 |---|---|---|
 | `date` | `String`（`YYYY-MM-DD`） | UTC 日期；序列化为字符串以避开 toml 对 chrono 的 feature 要求 |
 | `app` | `Option<String>` | 应用 id；`None` = 无凭证流量（默认策略）；TOML 行内为空串 |
-| `input` / `output` / `cache_read` / `cache_write` / `total` | `u64` | `total` 序列化时由各桶求和填入，反序列化时**忽略**（以各桶为准，兼容手工编辑） |
+| `input` / `output` / `cache_read` / `cache_write` / `total` | `u64` | `total` 序列化时由各桶**饱和**求和填入（ADR-L22），反序列化时**忽略**（以各桶为准，兼容手工编辑） |
 
 ---
 
@@ -258,7 +288,7 @@ anthropic 取数规则：`input = input_tokens`、`output = output_tokens`、`ca
   2. **解析 app**（ADR-L15）：入站凭证 = `Authorization: Bearer <k>`（scheme 大小写不敏感）或 `x-api-key: <k>`；无凭证 → `app = None`；有凭证但 `AppTable::find_by_key` 为 `None` → `401 UnknownAppKey`（fail-closed，消息提示 key 未注册）；命中且 `enabled == false` → `403 AppDisabled`。
   3. **缓冲请求 body**（上限 `MAX_REQUEST_BODY` = 16 MiB，ADR-L14）：超限 → `413 RequestBodyTooLarge`（不截断转发）；正常缓冲为 `Bytes` 后解析 JSON 取 `"model"` 字符串字段：非 JSON / 无 `model` / `model` 非字符串 → `model = None`（不拦截，风险 R11）。
   4. **组合校验**：`app` 为 `Some` 且其 `models` 非空且 `model` 为 `Some(m)` 且 `m` 不在组合内 → `403 ModelNotAllowedForApp`（消息含 model 与 app id）。`app == None` 或 `models` 为空 → 放行。
-  5. `select_and_record(state, protocol, model.as_deref())` 失败按其错误映射（404 / 503 / 429，house 错误体）。
+  5. `select_and_record(state, protocol, model.as_deref())` 失败直接走 `ApiError::into_response()` 渲染（404 / 503 / 429，house 错误体；429 时 `Retry-After` 头一并带上，ADR-L24）。**不再经 `proxy::error_response`**——两者错误体字节相同，`ApiError::into_response` 是 `ApiError` 渲染的唯一权威（429 的头只有前者能带出）。
   6. `state.llm_stats_for(provider.id).guard()`（Drop 记账）。
   7. 上游 URL = `base_url.trim_end_matches('/') + 剩余路径`。
   8. **body 改写**（ADR-L14）：`upstream_model` 为 `Some(u)` 且 `Some(u) != model` → 解析 JSON、把 `model` 字段替换为 `u`、重新序列化后发送；`upstream_model == model`（或 `None`，或 `model == None`）→ **原始 bytes 零差异透传**。
@@ -271,7 +301,7 @@ anthropic 取数规则：`input = input_tokens`、`output = output_tokens`、`ca
   13. 响应头：剥 hop-by-hop + `content-length`；**注入 `x-llm-provider: <provider id>`**。
   14. body：`Body::from_stream(usage tap)`——每块向客户端转发的同时复制进 `TailBuffer`；流正常结束 / 上游流出错 / **消费者断开** 三种情形都触发一次（互斥，只记一次）：先 `extract_tokens → record_tokens`（TPM 配额），再 `extract_usage → ledger.record(app_id, today, usage)`（ADR-L20）。**请求 body 不流式（已缓冲），响应 body 仍流式**。
   15. 上游 5xx：状态与 body 原样透传，同时计一次错误；4xx 原样透传不计错误。
-- 错误体：全部使用 `proxy::error_response` 的 house 格式。
+- 错误体：全部使用 house 格式（`ApiError::into_response`，与 `proxy::error_response` 同形；见第 5 步）。
 - 常量：`pub const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;`
 
 ---
@@ -294,7 +324,7 @@ anthropic 取数规则：`input = input_tokens`、`output = output_tokens`、`ca
 | GET | `/__admin/llm/apps/{id}` | `200` + 单应用（含 `key`） | 404、401 |
 | PUT | `/__admin/llm/apps/{id}` | `200` + 合并后的应用 | 400、404、401 |
 | DELETE | `/__admin/llm/apps/{id}` | `200 {"deleted":<id>}` | 404、401 |
-| GET | `/__admin/llm/usage` | `200 {"usage":[UsageEntry...]}`，全部可选 query 参数（见下） | 400（非法日期格式）、401 |
+| GET | `/__admin/llm/usage` | `200 {"usage":[UsageEntry...]}`，全部可选 query 参数（见下） | 400（非法日期格式 / 结构非法的 query string，均走 `InvalidUsageQuery`）、401 |
 
 - 所有供应商变更端点成功后先 `state.persist_providers()`，应用变更端点先 `state.persist_apps()`，再返回；持久化失败 → 500。
 - GET（列表与单项）返回的供应商 JSON **总是带 `proxy_url` 键**：未配置时为 `null`（与 `rpm_limit`/`tpm_limit`/`timeout_secs` 同构）——对 0.2.2 之前的消费者是纯新增键，不影响既有解析。
@@ -314,7 +344,9 @@ anthropic 取数规则：`input = input_tokens`、`output = output_tokens`、`ca
 | `from` | `YYYY-MM-DD` | 闭区间起点 |
 | `to` | `YYYY-MM-DD` | 闭区间终点 |
 
+- **空串 = 未传**：四个参数均以「参数出现但值为空」等同于未传来解析——`app` 空串不过滤任何应用，`?date=` / `?from=&to=` 不过滤任何日期（空串既不是合法 id 也不是合法日期，但不报 400，语义与省略一致）。
 - 日期解析用 `NaiveDate::parse_from_str(s, "%Y-%m-%d")`，且解析成功后再按同一格式回写比对原串——`%Y` 单独接受 1-4 位年份（`"26-11-06"` 会解析成 0026 年），只有规范 4 位年份的入串合法；任一参数格式或形态非法 → `400 InvalidUsageQuery`（消息含参数名与原值）。
+- **query string 本身结构非法**（如重复参数 `?date=a&date=b`、非法百分号转义）同样 → `400 InvalidUsageQuery`（消息 `malformed query string: ...`）。端点用 `RawQuery` + 手工 `serde_urlencoded` 解析而非 axum 的 `Query` 提取器——后者拒绝时回**纯文本** 400，会破坏 house JSON 错误契约（ADR-L23）。
 - 无参数 = 全量。返回按 `(date, app)` 升序；`app` 缺失的条目（无凭证流量）排在同日内最前。
 - 只读端点：不写盘、不清 dirty（落盘由 flush 任务与 shutdown 负责）。
 
@@ -363,7 +395,7 @@ anthropic 取数规则：`input = input_tokens`、`output = output_tokens`、`ca
 ### `run`（lib.rs）变更
 
 - 启动顺序：`load_routes` → `load_providers` → `load_apps` → `load_usage` → 四个 `set_all`；四者都缺失不致命。
-- 启动后按 `usage_flush_secs` spawn 周期 flush 任务（dirty 时才写盘）；`axum::serve` 结束（shutdown）后执行**最后一次 flush**，进程被 SIGKILL 强杀时丢失最近一个 flush 窗口（风险 R15）。
+- 启动后按 `usage_flush_secs` spawn 周期 flush 任务（dirty 时才写盘）；`axum::serve` 结束（shutdown）后**先 abort 周期 flush 任务**再执行**最后一次 flush**——abort 只在 await 点生效，进行中的写盘会先完成，并发安全由 `flush_if_dirty` 内部的 `flush_lock` 保证，末次写不会被周期任务的旧快照覆盖（ADR-L22）；进程被 SIGKILL 强杀时丢失最近一个 flush 窗口（风险 R15）。
 - `build_app` 新增 `nest("/llm", llm::llm_router())`，位于 admin nest 与 proxy fallback 之间；`/llm` 前缀保留（nest 优先于 fallback）。
 
 ---
@@ -376,7 +408,7 @@ anthropic 取数规则：`input = input_tokens`、`output = output_tokens`、`ca
 | `InvalidProvider(msg)` | 400 | `Provider::validate` 失败 |
 | `DuplicateProviderId(id)` | 400 | POST id 已存在 / PUT 与其他供应商冲突 |
 | `NoProviderForProtocol(protocol)` | 503 | 该协议没有启用供应商（**无 model 请求**时） |
-| `QuotaExhausted(msg)` | 429 | 全部候选供应商 RPM 或 TPM 余量为 0；有 model 时消息附带 model 名 |
+| `QuotaExhausted(msg, retry_after)` | 429 | 全部候选供应商 RPM 或 TPM 余量为 0；有 model 时消息附带 model 名；`retry_after: Option<Duration>` = 池级最早可能恢复时长（ADR-L24），`Some` 时响应附 `Retry-After` 头 |
 | `ModelNotFound(model)` | 404 | 请求带的 model 无任何供应商声明（消息提示模型表在 `/__admin/llm/providers`） |
 | `NoProviderForModel(model)` | 503 | 模型有供应商声明，但池空（全 disabled / 协议不匹配） |
 | `ModelNotAllowedForApp(model, app)` | 403 | 请求 model 不在命中 app 的模型组合内 |
@@ -387,9 +419,11 @@ anthropic 取数规则：`input = input_tokens`、`output = output_tokens`、`ca
 | `AppNotFound(id)` | 404 | GET/PUT/DELETE 未知 app id |
 | `RequestBodyTooLarge` | 413 | 请求 body 超过 `MAX_REQUEST_BODY`（16 MiB） |
 | `Internal(msg)` | 500 | 运行时构建代理 client 失败（ADR-L19；`validate` 已拦绝大多数非法 `proxy_url`，此为防御性兜底） |
-| `InvalidUsageQuery(msg)` | 400 | `/__admin/llm/usage` 的 `date`/`from`/`to` 参数不是 `YYYY-MM-DD` 格式（消息含参数名与原值） |
+| `InvalidUsageQuery(msg)` | 400 | `/__admin/llm/usage` 的 `date`/`from`/`to` 参数不是 `YYYY-MM-DD` 格式（消息含参数名与原值），或 query string 本身结构非法（消息 `malformed query string: ...`）——两种形态共用同一变体以保 JSON 信封（ADR-L23） |
 
-`QuotaExhausted` 的消息从「protocol 名」改为「携带 model 信息的可读串」（有 model 时含 model 名）；无 model 时保持原语义（协议名）。错误体格式不变（house 格式）。
+`QuotaExhausted(msg, retry_after)` 的消息从「protocol 名」改为「携带 model 信息的可读串」（有 model 时含 model 名）；无 model 时保持原语义（协议名）。错误体格式不变（house 格式）。
+
+**`Retry-After` 头**（ADR-L24）：`retry_after` 为 `Some(d)` 时 `IntoResponse` 插入 `Retry-After: <秒>`——值 = `ceil(d)` 后 clamp 到 `[1, 60]`（delta-seconds 形态）。`#[error(...)]` 的 Display **只读第一个字段**，故消息体字节不因第二字段而变——`retry_after` 对 JSON 响应是**纯加性**的。其他变体不带该头。头值是 advisory 最小退避下界而非预约（语义见「恢复时长语义」小节，风险 R19）。
 
 错误体沿用 `{"error":{"code":<u16>,"message":<thiserror 文本>}}`。
 

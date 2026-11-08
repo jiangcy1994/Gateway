@@ -1,4 +1,7 @@
-use axum::http::StatusCode;
+use std::time::Duration;
+
+use axum::http::header::RETRY_AFTER;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
@@ -39,7 +42,7 @@ pub enum ApiError {
     NoProviderForProtocol(String),
 
     #[error("quota exhausted for protocol '{0}': all providers are at their rpm or tpm limit")]
-    QuotaExhausted(String),
+    QuotaExhausted(String, Option<Duration>),
 
     #[error("model not found: '{0}' is not declared by any provider; register it under a provider's models at /__admin/llm/providers")]
     ModelNotFound(String),
@@ -113,7 +116,7 @@ impl ApiError {
                 StatusCode::BAD_REQUEST
             }
             ApiError::NoProviderForProtocol(_) => StatusCode::SERVICE_UNAVAILABLE,
-            ApiError::QuotaExhausted(_) => StatusCode::TOO_MANY_REQUESTS,
+            ApiError::QuotaExhausted(_, _) => StatusCode::TOO_MANY_REQUESTS,
             ApiError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             ApiError::NoProviderForModel(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::ModelNotAllowedForApp(_, _) => StatusCode::FORBIDDEN,
@@ -138,12 +141,24 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status();
-        (
+        let mut response = (
             status,
             Json(json!({
                 "error": { "code": status.as_u16(), "message": self.to_string() }
             })),
         )
-            .into_response()
+            .into_response();
+
+        // Retry-After 只随 429 配额耗尽出现（ADR-L24）：其余变体（404 / 503 /
+        // 401 / 403 / 413）与无时长（None）的 QuotaExhausted 绝不携带该头；
+        // 值为 delta-seconds 整数——ceil 保证永不为 0，clamp [1, 60] 纯防御性格式化。
+        if let ApiError::QuotaExhausted(_, Some(d)) = &self {
+            let secs = (d.as_secs_f64().ceil().clamp(1.0, 60.0)) as u64;
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(secs));
+        }
+
+        response
     }
 }

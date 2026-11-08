@@ -622,6 +622,78 @@ async fn llm_rpm_exhaustion_returns_429() {
     assert_eq!(q["rpm"]["remaining"], 0);
 }
 
+/// ADR-L24：RPM 耗尽的 429 携带 `Retry-After`（delta-seconds 整数 ∈ [1,60]），
+/// 消息体与加头前逐字节一致；同测试内非 429 错误（503 池空）不带该头。
+#[tokio::test]
+async fn llm_429_response_carries_retry_after() {
+    let upstream = spawn_mock_llm().await;
+    let mut p = provider("openai-official", Protocol::Openai, &upstream);
+    p.rpm_limit = Some(1);
+    let gw = spawn_llm_gateway(vec![p]).await;
+
+    // 首请求消费唯一 RPM 槽位
+    let first = authed()
+        .post(gateway_url(&gw, "/llm/openai/v1/chat/completions"))
+        .json(&json!({"model": "gpt-4o"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+
+    // 次请求：全池耗尽 → 429 + Retry-After；值只按域断言（Instant 不可注入，
+    // 恢复时刻 ≈ 记录 + 60s，故不钉具体秒数）
+    let second = authed()
+        .post(gateway_url(&gw, "/llm/openai/v1/chat/completions"))
+        .json(&json!({"model": "gpt-4o"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 429);
+    let secs: u64 = second
+        .headers()
+        .get("retry-after")
+        .expect("429 carries Retry-After (ADR-L24)")
+        .to_str()
+        .unwrap()
+        .parse()
+        .expect("Retry-After is integer delta-seconds");
+    assert!((1..=60).contains(&secs));
+
+    let err = error_body(second).await;
+    assert_eq!(err["code"], 429);
+    // 消息体钉成实际复合文案的逐字节快照（exhausted() 的文案经 ApiError 的
+    // thiserror Display 包装——`{0}` 内嵌一层 `quota exhausted for protocol
+    // '...': ...`，故比 exhausted() 的字面量长一圈）
+    assert_eq!(
+        err["message"].as_str().unwrap(),
+        "quota exhausted for protocol 'model 'gpt-4o': all providers are at their rpm or \
+         tpm limit (protocol openai)': all providers are at their rpm or tpm limit"
+    );
+
+    // 配额视图同步：remaining = 0（既有快照行为不回归）
+    let q = quota_view(&gw, "openai-official").await;
+    assert_eq!(q["rpm"]["used"], 1);
+    assert_eq!(q["rpm"]["remaining"], 0);
+
+    // 非 429 错误（模型有声明但池空 → 503）绝不携带 Retry-After（CK-5）
+    let mut disabled = provider_with_models(
+        "off",
+        Protocol::Openai,
+        &upstream,
+        vec![model("gpt-4o", None, 0)],
+    );
+    disabled.enabled = false;
+    let gw_off = spawn_llm_gateway(vec![disabled]).await;
+    let off = authed()
+        .post(gateway_url(&gw_off, "/llm/openai/v1/chat/completions"))
+        .json(&chat_request("gpt-4o"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(off.status(), 503);
+    assert!(!off.headers().contains_key("retry-after"));
+}
+
 #[tokio::test]
 async fn llm_exhausted_provider_falls_back_to_remaining() {
     let upstream = spawn_mock_llm().await;
@@ -2599,6 +2671,17 @@ async fn llm_usage_view_filters_by_app_date_range() {
             .len(),
         0
     );
+
+    // 空串 = 未传，四个参数同一约定：不报错、不过滤
+    assert_eq!(usage_view(&gw, "?date=").await.len(), 3);
+    assert_eq!(usage_view(&gw, "?from=&to=").await.len(), 3);
+
+    // 结构非法的 query 走 ApiError 的 400 JSON 信封（非 axum 纯文本拒绝）
+    let resp = admin_get(&gw, "/__admin/llm/usage?date=a&date=b").await;
+    assert_eq!(resp.status(), 400);
+    let err = error_body(resp).await;
+    assert_eq!(err["code"].as_u64().unwrap_or(0), 400);
+    assert!(err["message"].is_string());
 
     // 升序：无凭证条目（app = null）同日最前
     let rows = usage_view(&gw, "").await;

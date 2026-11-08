@@ -5,3 +5,6 @@ routes.local.toml
 .env
 __pycache__/
 observation/**/.token
+.specs/scratchpad/*.md
+.specs/analysis/*.md
+.specs/reports/*.md

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::thread_rng;
 
@@ -74,7 +76,16 @@ pub fn select_and_record(
         .collect();
 
     if weights.iter().all(|&w| w <= 0.0) {
-        return Err(exhausted(protocol, model));
+        // guards 仍全部持有（本函数同步、临界区内无 await）：池级恢复时长取
+        // 全部候选的 min——filter_map 跳过返回 None 的候选（该维不限额或未耗尽；
+        // Option 的 Ord 把 None 排在 Some 之前，裸 .min() 会被任一不限额候选坍缩到 None）。
+        // 恢复时刻的推导只在 QuotaGuard::retry_after 一处，此处仅聚合（ADR-L24 单源）。
+        let retry_after = guards
+            .iter()
+            .zip(candidates.iter())
+            .filter_map(|(g, c)| g.retry_after(c.provider.rpm_limit, c.provider.tpm_limit))
+            .min();
+        return Err(exhausted(protocol, model, retry_after));
     }
 
     // 分层（ADR-L16）：按 priority 降序切成相同 priority 的连续层，从高到低
@@ -112,12 +123,17 @@ pub fn select_and_record(
 }
 
 /// 429 的消息：协议级请求沿用旧文案；带 model 的请求给出 model 上下文。
-fn exhausted(protocol: Protocol, model: Option<&str>) -> ApiError {
+/// `retry_after` 为池级聚合的「最早可能恢复」剩余时长（ADR-L24），只作为变体
+/// 第二字段透传，绝不进入消息文案（body 对客户端纯加性）。
+fn exhausted(protocol: Protocol, model: Option<&str>, retry_after: Option<Duration>) -> ApiError {
     match model {
-        Some(model) => ApiError::QuotaExhausted(format!(
-            "model '{model}': all providers are at their rpm or tpm limit (protocol {protocol})"
-        )),
-        None => ApiError::QuotaExhausted(protocol.to_string()),
+        Some(model) => ApiError::QuotaExhausted(
+            format!(
+                "model '{model}': all providers are at their rpm or tpm limit (protocol {protocol})"
+            ),
+            retry_after,
+        ),
+        None => ApiError::QuotaExhausted(protocol.to_string(), retry_after),
     }
 }
 
