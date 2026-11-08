@@ -47,7 +47,7 @@
 
 - 对外 HTTP：`GET /health`（无需鉴权）、`/__admin/*`（需 `X-Admin-Key`）、`/llm/*`（内嵌 LLM 子网关）、`/qqbot/*`（内嵌 QQ Bot 子网关），其余路径全部走代理。
 - **保留前缀**：`/llm` 与 `/qqbot` 由内嵌子网关处理，永远不会落到前缀路由；不要在 `routes.toml` 里挂这两个前缀。
-- 管理 API：`GET/POST /__admin/routes`、`GET/PUT/DELETE /__admin/routes/{id}`、`GET /__admin/health`、`GET /__admin/metrics`、`POST /__admin/probe`；`GET/POST /__admin/llm/providers`、`GET/PUT/DELETE /__admin/llm/providers/{id}`、`GET /__admin/llm/quota`、`GET /__admin/llm/metrics`；`GET/POST /__admin/qqbot/bots`、`GET/PUT/DELETE /__admin/qqbot/bots/{id}`、`GET /__admin/qqbot/ws`、`GET /__admin/qqbot/metrics`。
+- 管理 API：`GET/POST /__admin/routes`、`GET/PUT/DELETE /__admin/routes/{id}`、`GET /__admin/health`、`GET /__admin/metrics`、`POST /__admin/probe`；`GET/POST /__admin/llm/providers`、`GET/PUT/DELETE /__admin/llm/providers/{id}`、`GET/POST /__admin/llm/apps`、`GET/PUT/DELETE /__admin/llm/apps/{id}`、`GET /__admin/llm/quota`、`GET /__admin/llm/metrics`、`GET /__admin/llm/usage`；`GET/POST /__admin/qqbot/bots`、`GET/PUT/DELETE /__admin/qqbot/bots/{id}`、`GET /__admin/qqbot/ws`、`GET /__admin/qqbot/metrics`。
 - Rust 公共 API：`build_app(state) -> Router`、`run(settings)`、`AppState::new(settings)`、`RouteTable::{set_all, list, get, match_route, add, replace, remove}`。
 - 完整签名与前后置条件见 [sdd/interfaces.md](sdd/interfaces.md)；子系统契约见各自子套件的 `interfaces.md`。
 

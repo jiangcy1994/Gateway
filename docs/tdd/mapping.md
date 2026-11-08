@@ -67,6 +67,7 @@
 | `llm_unknown_model_returns_404` | `llm/forward` 后置第 5 步（`ModelNotFound`） | 无任何供应商声明的 model → 404，消息提示模型表位置 |
 | `llm_model_all_disabled_returns_503` | `llm/forward` 后置第 5 步（`NoProviderForModel`） | 模型有声明但池空（disabled / 协议不匹配）→ 503 |
 | `llm_all_tiers_exhausted_returns_429` | `llm/forward` 后置第 5 步（分层 429） | 所有层 weight 全 0 → 429，house 错误体含 model |
+| `llm_429_response_carries_retry_after` | ADR-L24 / interfaces.md 的 Retry-After 条 / llm/forward 后置第 3 步 | 429 携带 Retry-After（整数秒 ∈ [1,60]，delta-seconds）；消息体与变更前逐字节一致；同测试内非 429 错误不带该头；内联 quota_view 钉住 remaining == 0 |
 | `llm_model_request_skips_empty_models_provider` | ADR-L14 显式声明优先于兜底 | 并存空模型表 provider 与声明该 model 的 provider 时，声明者被优先选中 |
 | `llm_catchall_provider_passes_model_through` | ADR-L14 空表兜底 | 只有空模型表 provider 时，带 model 的请求 model 原样透传、路由命中 |
 | `llm_app_combo_allows_models_without_model_field` | ADR-L15（组合盲区）+ 风险 R11 | app 组合非空但请求 body 无 `model` 字段 → 放行（不拦截） |
@@ -87,7 +88,7 @@
 | `llm_usage_records_per_app_buckets` | ADR-L20（按日 × 应用账本）+ `llm/forward` 后置第 14 步 | openai 非流式响应的四桶（`prompt_tokens` 含 cached 时 input 归一减去）、`total` = 四桶之和；app 维度独立记账（两个 app 各自累加、互不串）；无凭证请求单列为 `app: null` 条目 |
 | `llm_usage_records_anthropic_cache_buckets` | ADR-L20（跨协议桶对齐）+ `extract_usage` anthropic 契约 | `input_tokens` → `input`、`output_tokens` → `output`、`cache_read_input_tokens` → `cache_read`、`cache_creation_input_tokens` → `cache_write` |
 | `llm_usage_records_from_streaming_final_chunk` | `extract_usage` SSE 契约 | openai SSE 多个 `data:` 块的 usage 聚合；anthropic SSE 取首个 input/cache 值 + 末个累计 output |
-| `llm_usage_view_filters_by_app_date_range` | `llm/admin` usage 端点表 | `app` / `date` / `from`/`to`（闭区间）过滤AND；返回按 `(date, app)` 升序、无凭证条目同日最前；非法日期参数（`not-a-date` / `26-11-06`）→ 400 |
+| `llm_usage_view_filters_by_app_date_range` | `llm/admin` usage 端点表 + ADR-L23（查询契约） | `app` / `date` / `from`/`to`（闭区间）过滤AND；返回按 `(date, app)` 升序、无凭证条目同日最前；非法日期参数（`not-a-date` / `26-11-06`）→ 400；**空串 = 未传**（`?date=` / `?from=&to=` 不过滤、不报错）；结构非法的 query string（`?date=a&date=b`）→ 400 且错误体为 `{"error":{"code":400,...}}` JSON 信封（非 axum `Query` 提取器的纯文本拒绝） |
 | `llm_usage_ledger_flush_writes_and_reloads` | ADR-L20/L21 + `load_usage`/`save_usage` 后置 | flush 后 `usage.toml` 存在且 round-trip；另一进程（新网关）启动加载后 `/__admin/llm/usage` 可见历史 |
 | `llm_usage_ledger_clean_no_op` | `flush_if_dirty` 后置（不 dirty 不写盘） | 无流量时 flush 不创建文件 / 不改动现有文件（钉住「flush 不是无脑周期写」） |
 | `llm_usage_records_systemone_zero_buckets` | ADR-L8/L20 桩契约（账本侧同构） | systemone 流量条目存在但四桶恒 0（账本不因桩产生虚假用量） |

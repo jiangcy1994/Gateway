@@ -159,9 +159,10 @@ pub async fn forward(
 
     let selection = match balancer::select_and_record(&state, protocol, model.as_deref()) {
         Ok(selection) => selection,
-        // 其余变体（ModelNotFound → 404、NoProviderForModel → 503、
-        // QuotaExhausted → 429 …）一律按 `ApiError::status` 走，两处不再各写一张表。
-        Err(e) => return error_response(e.status(), &e.to_string()),
+        // 渲染一律走 house 的 `ApiError::into_response`（`{"error":{code,message}}`
+        // 信封的唯一权威）：Retry-After 头随 QuotaExhausted（429）到达 /llm 响应
+        // （ADR-L24），其余变体的输出与 proxy::error_response 逐字节相同。
+        Err(e) => return e.into_response(),
     };
     let provider = selection.provider;
 

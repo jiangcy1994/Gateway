@@ -395,7 +395,11 @@ pub fn save_usage(path: &std::path::Path, entries: &[UsageEntry]) -> Result<(), 
             output: entry.output,
             cache_read: entry.cache_read,
             cache_write: entry.cache_write,
-            total: entry.input + entry.output + entry.cache_read + entry.cache_write,
+            total: entry
+                .input
+                .saturating_add(entry.output)
+                .saturating_add(entry.cache_read)
+                .saturating_add(entry.cache_write),
         })
         .collect();
     let text = toml::to_string_pretty(&UsageFile { usage: rows })

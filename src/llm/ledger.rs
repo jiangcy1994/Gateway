@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use chrono::NaiveDate;
@@ -50,11 +50,14 @@ pub struct UsageFilter {
 /// 按日 × 应用的用量账本（ADR-L20）：主键 `(UTC 日期, app id)`，值为跨协议
 /// 归一的四桶 usage。与配额路径完全解耦——`extract_tokens` / `QuotaTracker`
 /// 不经过这里，本账本的锁也不与任何 `QuotaTracker` 的锁嵌套（`UsageTap::finish`
-/// 先记配额、再记账本）。`Clone` 是廉价的：两个成员都是 `Arc`。
+/// 先记配额、再记账本）。`Clone` 是廉价的：三个成员都是 `Arc`。
 #[derive(Debug, Clone, Default)]
 pub struct UsageLedger {
     inner: Arc<RwLock<BTreeMap<(NaiveDate, String), Usage>>>,
     dirty: Arc<AtomicBool>,
+    /// 串行化所有 flush（周期任务 × 末次 flush）：全量写盘不能并发，
+    /// 否则后写的旧快照会覆盖先写的新数据。
+    flush_lock: Arc<Mutex<()>>,
 }
 
 impl UsageLedger {
@@ -62,6 +65,7 @@ impl UsageLedger {
         Self {
             inner: Arc::new(RwLock::new(BTreeMap::new())),
             dirty: Arc::new(AtomicBool::new(false)),
+            flush_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -79,56 +83,27 @@ impl UsageLedger {
     /// 按过滤条件取快照。AND 语义；结果按 `(date, app)` 升序（BTreeMap 自然序，
     /// 同日无凭证条目 `""` 排最前）；无凭证条目在视图边界转成 `app: None`。
     pub fn snapshot(&self, filter: &UsageFilter) -> Vec<UsageEntry> {
-        let map = self.inner.read().unwrap();
-        map.iter()
-            .filter(|((date, app), _)| {
-                if let Some(want) = &filter.app {
-                    if app != want {
-                        return false;
-                    }
-                }
-                if let Some(day) = filter.date {
-                    if *date != day {
-                        return false;
-                    }
-                }
-                if let Some(from) = filter.from {
-                    if *date < from {
-                        return false;
-                    }
-                }
-                if let Some(to) = filter.to {
-                    if *date > to {
-                        return false;
-                    }
-                }
-                true
-            })
-            .map(|((date, app), usage)| UsageEntry {
-                date: date.to_string(),
-                app: if app.is_empty() {
-                    None
-                } else {
-                    Some(app.clone())
-                },
-                input: usage.input,
-                output: usage.output,
-                cache_read: usage.cache_read,
-                cache_write: usage.cache_write,
-                total: usage.total(),
-            })
-            .collect()
+        snapshot_entries(&self.inner.read().unwrap(), filter)
     }
 
     /// dirty 才写盘（全量原子写，`config::save_usage`）；否则完全不动文件——
     /// 不创建、不改 mtime（钉住「flush 不是无脑周期写」）。
+    ///
+    /// 并发安全（ADR-L21/L22）：`flush_lock` 串行化所有 flush（含写盘）；进入临界区后，
+    /// 「清 dirty」与「快照」在同一把 map 写锁下完成——并发 `record` 要么
+    /// 落进本次快照，要么在清位之后重新置位，不会出现「已记账但 dirty =
+    /// false」的夹缝（R15 的丢失窗口因此严格短于一次 flush 成功之后的时长）。
     pub fn flush_if_dirty(&self, path: &Path) -> Result<(), ApiError> {
+        let _guard = self.flush_lock.lock().unwrap();
         if !self.dirty.load(Ordering::Acquire) {
             return Ok(());
         }
-        let entries = self.snapshot(&UsageFilter::default());
+        let entries = {
+            let map = self.inner.write().unwrap();
+            self.dirty.store(false, Ordering::Release);
+            snapshot_entries(&map, &UsageFilter::default())
+        };
         crate::config::save_usage(path, &entries)?;
-        self.dirty.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -158,7 +133,53 @@ impl UsageLedger {
     }
 }
 
-/// 周期 flush 任务（ADR-L21）：每 `GATEWAY_USAGE_FLUSH_SECS` 秒写一次盘；
+/// `snapshot` 与 `flush_if_dirty` 共用的视图计算：过滤（AND 语义）+
+/// 无凭证条目 `""` → `app: None` 的边界转换 + `total` 重算。
+fn snapshot_entries(
+    map: &BTreeMap<(NaiveDate, String), Usage>,
+    filter: &UsageFilter,
+) -> Vec<UsageEntry> {
+    map.iter()
+        .filter(|((date, app), _)| {
+            if let Some(want) = &filter.app {
+                if app != want {
+                    return false;
+                }
+            }
+            if let Some(day) = filter.date {
+                if *date != day {
+                    return false;
+                }
+            }
+            if let Some(from) = filter.from {
+                if *date < from {
+                    return false;
+                }
+            }
+            if let Some(to) = filter.to {
+                if *date > to {
+                    return false;
+                }
+            }
+            true
+        })
+        .map(|((date, app), usage)| UsageEntry {
+            date: date.to_string(),
+            app: if app.is_empty() {
+                None
+            } else {
+                Some(app.clone())
+            },
+            input: usage.input,
+            output: usage.output,
+            cache_read: usage.cache_read,
+            cache_write: usage.cache_write,
+            total: usage.total(),
+        })
+        .collect()
+}
+
+/// 周期 flush 任务（ADR-L21/L22）：每 `GATEWAY_USAGE_FLUSH_SECS` 秒写一次盘；
 /// `0` = 不起周期任务，仅 shutdown flush。写盘失败只告警——账本丢一个窗口
 /// 不影响配额与转发（R15）。
 pub fn spawn_flush(state: AppState) -> tokio::task::JoinHandle<()> {

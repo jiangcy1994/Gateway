@@ -205,7 +205,8 @@ LLM 管理端点（同样需要 `X-Admin-Key`）：
 选择行为：带 `model` 时，无任何供应商声明该模型 → `404`（`ModelNotFound`，
 提示去 `/__admin/llm/providers` 登记模型表）；模型有声明但池空（全 disabled /
 协议不匹配）→ `503`（`NoProviderForModel`）；所有层都满 RPM 或 TPM → `429`
-（`QuotaExhausted`）；不带 `model` 时维持原语义——协议下无启用供应商 → `503`。
+（`QuotaExhausted`，响应附 `Retry-After` 头给出池级最早可能恢复的秒数——
+advisory：最小退避依据，非预约）；不带 `model` 时维持原语义——协议下无启用供应商 → `503`。
 `/llm/v1` 下两协议共用或未登记的端点 → `404`。TPM 由响应尾包里的 `usage`
 字段事后计量（非流式取 JSON，流式取末尾 `data:` 块），解析不到时记 0，永不失败。
 
@@ -220,7 +221,9 @@ LLM 管理端点（同样需要 `X-Admin-Key`）：
 | `cache_write` | （无，恒 0） | `cache_creation_input_tokens` |
 
 查询参数全部可选：`app`（精确匹配应用 id）、`date`（单日）、`from` / `to`
-（闭区间，格式 `YYYY-MM-DD`，非法返回 400）。返回按 `(date, app)` 升序：
+（闭区间，格式 `YYYY-MM-DD`，非法返回 400）。**空串等同于未传**（`?date=`、
+`?from=&to=` 都不过滤）；日期格式非法或 query string 本身结构非法（如
+`?date=a&date=b`）返回 400，错误体为统一 JSON 信封。返回按 `(date, app)` 升序：
 `[{"date":"2026-11-06","app":"cli-code","input":12340,"output":890,
 "cache_read":2100,"cache_write":0,"total":15330}, ...]`。账本周期写回
 `GATEWAY_USAGE_FILE`（默认 `usage.toml`，全量原子写），正常关停时落盘一次，

@@ -1,4 +1,4 @@
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -219,28 +219,35 @@ async fn get_metrics(
 
 /// `GET /__admin/llm/usage`：按日 × 应用的分桶用量查询（ADR-L20）。只读，
 /// 不触发写盘；过滤参数 AND 语义，`from`/`to` 闭区间，非法日期 → 400
-/// （`ApiError::InvalidUsageQuery`，消息带参数名与原值）。
+/// （`ApiError::InvalidUsageQuery`，消息带参数名与原值）。查询字符串本身
+/// 结构非法也走同一 400 JSON 信封（不交给 axum 的 `Query` 拒绝路径，
+/// 保持 `{"error":{...}}` 的错误契约）。
 async fn get_usage(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(params): Query<UsageQuery>,
+    RawQuery(raw): RawQuery,
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers)?;
+    let params: UsageQuery = serde_urlencoded::from_str(raw.as_deref().unwrap_or_default())
+        .map_err(|e| ApiError::InvalidUsageQuery(format!("malformed query string: {e}")))?;
     let filter = UsageFilter {
         app: params.app.filter(|s| !s.is_empty()),
         date: params
             .date
             .as_deref()
+            .filter(|s| !s.is_empty())
             .map(|value| parse_date("date", value))
             .transpose()?,
         from: params
             .from
             .as_deref()
+            .filter(|s| !s.is_empty())
             .map(|value| parse_date("from", value))
             .transpose()?,
         to: params
             .to
             .as_deref()
+            .filter(|s| !s.is_empty())
             .map(|value| parse_date("to", value))
             .transpose()?,
     };
@@ -260,9 +267,8 @@ fn parse_date(name: &str, value: &str) -> Result<NaiveDate, ApiError> {
     Ok(parsed)
 }
 
-/// `/__admin/llm/usage` 的查询字符串参数：全部可选，全部「空串 = 未传」。
-/// 结构非法的 query（axum `Query` 反序列化拒绝）由 axum 回 400，与
-/// `ApiError` 的 400 同状态码。
+/// `/__admin/llm/usage` 的查询字符串参数：全部可选，全部「空串 = 未传」
+/// （`app` 与 `date`/`from`/`to` 同一约定——空日期不再被当成非法值报 400）。
 #[derive(Debug, Default, Deserialize)]
 struct UsageQuery {
     #[serde(default)]

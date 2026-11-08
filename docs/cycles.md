@@ -139,6 +139,21 @@ top-gateway 的功能按 `sdd/architecture.md` 的依赖底向上实现：`route
 - 绿：无新实现（桩与查询串在 C16-C19 的实现中已就位）。
 - 重构：无。
 
+### C30 审查驱动加固：flush 并发 / 关停顺序 / 饱和求和 / 查询契约（→ ADR-L22 / ADR-L23）
+- 红：**无**——本轮改动来自一次系统性**代码审查**而非需求 / 规格先行，没有先行的失败测试（审查发现的是并发时序与契约一致性问题，非功能回归）。如实记录：这是「测试是验证者而非驱动者」的形态，与 C16-C23 的需求驱动路径不同。
+- 绿：四处实现加固，各自由既有或扩展后的测试钉住：
+  1. **flush 并发**（`ledger.rs`）：新增 `flush_lock: Mutex<()>`，`flush_if_dirty` 持锁全程（含写盘）；「快照 + 清 dirty」收进同一把 map 写锁临界区——消除「周期 flush 与末次 flush 并发时旧快照覆盖新数据」与「快照/清位夹缝」两个缺口。
+  2. **关停顺序**（`lib.rs`）：shutdown 时先 `abort()` 周期 flush 任务再末次 `flush_if_dirty`。
+  3. **饱和求和**（`usage.rs` / `config.rs`）：`Usage::total()`、`Usage + Usage`、`save_usage` 的 total 全改 `saturating_add`——上游返回接近 `u64::MAX` 的极端 / 恶意值不再 debug panic / release 回绕。
+  4. **usage 查询契约**（`admin.rs`）：`RawQuery` + 手工 `serde_urlencoded` 取代 axum `Query` 提取器（其拒绝路径回纯文本 400，破坏 house JSON 信封）；四个过滤参数统一「空串 = 未传」。
+- 验证：`llm_usage_view_filters_by_app_date_range` 内联扩展（空串不过滤、结构非法 query string → 400 JSON 信封）；新增 src 内单测 `usage_total_and_addition_saturate`（饱和语义）。**flush 的三条并发不变式没有确定性回归测试**（竞态无法稳定复现），靠锁序推理成立并留在代码注释里，验证缺口登记为风险 R18。
+- 重构：无（加固性改动，不动外部接口形态）。
+
+### C31 429 的 `Retry-After` 头：恢复时长可算（→ ADR-L24 / `quota.rs` `retry_after`）
+- 红：`llm_429_response_carries_retry_after`——在 `QuotaExhausted` 只带消息串的形态下断言 `Retry-After` 头存在，头不存在而失败；同批 src 内单测 `quota_retry_after_none_when_unlimited_or_not_exhausted` / `quota_retry_after_rpm_tracks_evicting_entry` / `quota_retry_after_tpm_accumulates_from_front` 是**编译期红**（`retry_after` 方法不存在，等价于运行期 FAIL）。
+- 绿：`QuotaGuard::retry_after(rpm_limit, tpm_limit)`（RPM = `requests[len - limit] + WINDOW`，TPM = 从前累加至剩余 `< limit` 的条目 `+ WINDOW`，供应商级 max）；balancer 的 429 分支在**既有临界区**内取候选 min 传入 `QuotaExhausted(String, Option<Duration>)`；`error.rs` 的 `IntoResponse` 在 `Some` 时输出 `Retry-After: <ceil 秒，clamp [1,60]>`（Display 只读第一字段 → 消息体字节不变）；`forward.rs` 的选择错误改走 `ApiError::into_response()`（与 `error_response` 错误体字节相同，头才能带到 `/llm` 响应）。
+- 重构：无（纯加性：guard 新方法 / 变体扩字段 / 一处渲染路径统一；429 语义与消息体不变）。ADR-L24；R6 mitigation 更新为已实现，新增 R19（advisory 语义）。
+
 ---
 
 ## QQ Bot 子网关（`src/qqbot/`，`tests/qqbot_gateway.rs`）

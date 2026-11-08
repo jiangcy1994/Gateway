@@ -136,6 +136,10 @@ QuotaInner {
 - **TPM 在响应记账时累加**：`record_tokens(n)` 追加一条；`n == 0` 也追加（「无 usage」与「未完成」同样占用请求历史，但 token 为 0）。
 - 每次读（剩余量 / 快照）先**淘汰**窗口外条目（`while front < now - window`）。
 - 在途（已派遣、未完成）请求的 token 尚未入账 → 窗口内 TPM 略低于真实占用（风险 R2）。
+- **恢复时长**（ADR-L24）：窗口从「满」回到「可再派遣」的时刻由**触发阈值的那条记录**决定，两式都由淘汰谓词（`entry + window <= now`，即 `now - entry >= window`）直接反推：
+  - **RPM 耗尽**（`len >= limit`）：`recovery = requests[len - limit] + window`——淘汰掉 `len - limit + 1` 条最旧后，窗口内只剩 `limit - 1 < limit` 条。
+  - **TPM 耗尽**（`sum >= limit`）：从前累加被淘汰量，首个令剩余量 `< limit` 的条目 `i`：`recovery = tokens[i].instant + window`（P4 保证 `limit > 0`，故必终止）。
+  - **供应商级 = max**（`weight = min`，两维都恢复才算恢复）；**池级 = min**（429 时所有候选都耗尽，任一恢复即可调度）。guard 创建时已淘汰窗口外条目，故恢复时刻恒在未来（`(0, window)`），响应头取 `ceil` 秒并 clamp `[1, 60]` 属防御性格式化。
 - tracker 按 provider id 存在 `AppState` 的独立 map；供应商删除后 tracker 保留（历史计数不丢），配额视图只 join 当前表。
 
 ### `TailBuffer`（usage.rs）
@@ -149,7 +153,7 @@ TailBuffer { buf: Vec<u8>, cap: usize }   // cap = 64 KiB
 
 ### `Usage`（usage.rs，ADR-L20）
 
-跨协议对齐的 token 分桶明细（`input` / `output` / `cache_read` / `cache_write`，均 `u64`，`Default` = 全 0）。`total = input + output + cache_read + cache_write`（由 `total()` 计算，不存字段）。归一化规则（提取时应用，见 `interfaces.md`）：
+跨协议对齐的 token 分桶明细（`input` / `output` / `cache_read` / `cache_write`，均 `u64`，`Default` = 全 0）。`total = input + output + cache_read + cache_write`（由 `total()` 计算，不存字段；**饱和**求和——`total()` 与 `Usage + Usage` 均用 `saturating_add`，极端 / 恶意上游值不回绕、不 panic，ADR-L22）。归一化规则（提取时应用，见 `interfaces.md`）：
 
 | 协议 | input | output | cache_read | cache_write |
 |---|---|---|---|---|
@@ -166,6 +170,7 @@ TailBuffer { buf: Vec<u8>, cap: usize }   // cap = 64 KiB
 UsageLedger {
     inner: RwLock<BTreeMap<(NaiveDate, String), Usage>>,   // key: (日期 UTC, app id；无凭证 = "")
     dirty: AtomicBool,
+    flush_lock: Mutex<()>,   // 串行化所有 flush（周期 × 末次，ADR-L22）
 }
 ```
 
@@ -174,7 +179,7 @@ UsageLedger {
 - 聚合维度为 app 而非供应商：账本回答「哪个应用哪天用了多少 token」，与配额（供应商维度）正交；同一响应不会被按供应商再记一份。
 - `BTreeMap` 天然按 `(date, app)` 排序——admin 视图与落盘顺序即 map 迭代序，无需另排。
 - dirty 位：`record` 置位，`flush_if_dirty` 落盘后清除；**flush 任务只在 dirty 时写盘**，空闲窗口不做无谓 IO。
-- 并发：`record` 只持有 ledger 写锁（在 `UsageTap::finish` 中、quota 记账之后，**不与任何 quota 锁嵌套**）；`flush_if_dirty` 取读锁快照后在锁外序列化——flush 与 record 可以交错，但 dirty 仍在，**不丢条目，只可能延迟一个 flush 窗口**。
+- 并发（ADR-L22 修订）：`record` 只持有 ledger 写锁（在 `UsageTap::finish` 中、quota 记账之后，**不与任何 quota 锁嵌套**）；`flush_if_dirty` 持 `flush_lock` 全程，其内在**同一把写锁**里完成「快照 + 清 dirty」——清位与快照不存在夹缝，并发 `record` 要么进快照、要么在清位后重新置位 dirty，**不丢条目，只可能延迟一个 flush 窗口**。
 
 ## 观测快照（`QuotaSnapshot`，序列化形态）
 
@@ -195,9 +200,9 @@ UsageLedger {
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `date` | `String`（`YYYY-MM-DD`） | UTC 日期；字符串形态规避 toml 对 chrono feature 的要求 |
-| `app` | `Option<String>` | 应用 id；`None` = 无凭证流量（存储哨兵为空串，见 P15/P16） |
+| `app` | `Option<String>` | 应用 id；`None` = 无凭证流量（存储哨兵为空串，见下文 `UsageLedger` 与 ADR-L20） |
 | `input` / `output` / `cache_read` / `cache_write` | `u64` | 分桶明细 |
-| `total` | `u64` | 各桶之和；**序列化时填入、反序列化时忽略**（以桶为准，兼容手工编辑） |
+| `total` | `u64` | 各桶**饱和**之和（ADR-L22）；**序列化时填入、反序列化时忽略**（以桶为准，兼容手工编辑） |
 
 ## 持久化形态（providers.toml）
 
@@ -267,7 +272,7 @@ cache_write = 0
 total = 620
 ```
 
-`UsageFile { usage: Vec<UsageEntry> }`；缺文件非致命、原子写、重写丢注释；**全量写**（不做增量追加）。加载时 `(date, app)` 重复行合并累加；`total` 反序列化时忽略。**这是观测数据而非配置**：没有任何管理 API 能写它，唯一的写入者是 flush 任务与 shutdown flush（手工编辑可读，但会在下次落盘时被覆盖）。
+`UsageFile { usage: Vec<UsageEntry> }`；缺文件非致命、原子写、重写丢注释；**全量写**（不做增量追加）。加载时 `(date, app)` 重复行合并累加；`total` 反序列化时忽略。**这是观测数据而非配置**：没有任何管理 API 能写它，唯一的写入者是周期 flush 任务与 shutdown 末次 flush（二者经 `flush_lock` 串行化，shutdown 时先 abort 周期任务——ADR-L22；手工编辑可读，但会在下次落盘时被覆盖）。
 
 ## 数据流上的形态
 

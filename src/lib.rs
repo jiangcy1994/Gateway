@@ -122,7 +122,7 @@ pub async fn run_with_shutdown(
     }
 
     health::spawn(state.clone());
-    llm::ledger::spawn_flush(state.clone());
+    let flush_task = llm::ledger::spawn_flush(state.clone());
 
     let app = build_app(state.clone());
     let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -137,8 +137,11 @@ pub async fn run_with_shutdown(
         .with_graceful_shutdown(shutdown)
         .await?;
 
-    // 末次 flush（ADR-L21）：graceful 排空之后把在途窗口内的记账落盘。失败
-    // 只告警——统计 loses 一个窗口，不影响配额与转发（R15）。
+    // 末次 flush（ADR-L21/L22）：graceful 排空之后把在途窗口内的记账落盘。先停掉
+    // 周期 flush 任务（abort 只在 await 点生效，进行中的写盘会先完成；并发安全
+    // 由 `flush_if_dirty` 内部的 `flush_lock` 串行化保证），避免周期任务的旧快照
+    // 后写覆盖末次写。失败只告警——账本丢一个窗口，不影响配额与转发（R15）。
+    flush_task.abort();
     if let Err(e) = state.llm_usage.flush_if_dirty(&state.settings.usage_file) {
         tracing::error!("final usage ledger flush failed: {e}");
     }

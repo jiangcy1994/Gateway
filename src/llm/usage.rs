@@ -45,9 +45,13 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// 四桶之和。
+    /// 四桶之和（saturating：与 `Add` 一致；桶来自上游响应，极端/恶意值
+    /// 不能让快照或 flush 在 debug 下 panic、在 release 下回绕出负增长的 total）。
     pub fn total(&self) -> u64 {
-        self.input + self.output + self.cache_read + self.cache_write
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
     }
 }
 
@@ -509,5 +513,24 @@ mod tests {
             extract_usage(Protocol::Systemone, Some("application/json"), body),
             Usage::default()
         );
+    }
+
+    #[test]
+    fn usage_total_and_addition_saturate() {
+        // 桶来自上游响应：极端 / 恶意值不能让 total 或逐桶累加回绕出
+        // 负增长（R16；panic 只在 debug 下发生，release 下是静默回绕）。
+        let huge = Usage {
+            input: u64::MAX,
+            output: 1,
+            cache_read: u64::MAX,
+            cache_write: 1,
+        };
+        assert_eq!(huge.total(), u64::MAX);
+        let summed = huge + huge;
+        assert_eq!(summed.input, u64::MAX);
+        assert_eq!(summed.output, 2);
+        assert_eq!(summed.cache_read, u64::MAX);
+        assert_eq!(summed.cache_write, 2);
+        assert_eq!(summed.total(), u64::MAX);
     }
 }
